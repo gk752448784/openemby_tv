@@ -158,6 +158,7 @@
     <string name="error_network_error">网络错误，请重试</string>
     <string name="error_unknown">未知错误</string>
     <string name="error_proxy_connection">代理连接失败，请检查代理信息是否正确</string>
+    <string name="audio_output_degraded">电视音频服务异常，本次播放暂无声音</string>
 
     <!-- Intro Skip -->
     <string name="skip_intro">跳过片头</string>

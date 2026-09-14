@@ -158,6 +158,7 @@
     <string name="error_network_error">Network error, please try again</string>
     <string name="error_unknown">Unknown error</string>
     <string name="error_proxy_connection">Proxy connection failed, please check proxy information</string>
+    <string name="audio_output_degraded">TV audio service error. Playback continues without sound</string>
 
     <!-- Intro Skip -->
     <string name="skip_intro">Skip Intro</string>

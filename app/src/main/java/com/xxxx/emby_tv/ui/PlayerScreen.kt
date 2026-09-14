@@ -41,8 +41,15 @@ import androidx.media3.common.Player
 import androidx.media3.common.Tracks
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.Timeline
+import androidx.media3.common.TrackSelectionParameters
+import androidx.media3.common.audio.ChannelMixingAudioProcessor
+import androidx.media3.common.audio.ChannelMixingMatrix
+import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.text.CueGroup
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.audio.AudioCapabilities
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import androidx.media3.ui.PlayerView
 import androidx.compose.ui.res.stringResource
@@ -97,6 +104,14 @@ import kotlinx.coroutines.withContext
  */
 // 字幕顶部预留比例：UI 100% 映射到实际 88%，保证字幕不出屏
 private const val SUBTITLE_TOP_RESERVED_FRACTION = 0.12f
+
+// 音频安全模式（进程级）：
+// 部分电视固件在"多声道 PCM → 立体声"系统降混路径上存在 bug，触发后音频 HAL 卡死，
+// AudioTrack 创建持续返回 DEAD_OBJECT（有画面无声音、一直转圈加载），只能重启电视恢复。
+// 触发过一次故障后，本进程内后续播放器一律直接以立体声安全模式构建，从源头避开该路径；
+// 重启 APP 后自动重试原生多声道。
+private var audioSafeModeChannels = -1
+private const val AUDIO_RECOVERY_TAG = "AudioRecovery"
 @androidx.annotation.OptIn(UnstableApi::class)
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -211,75 +226,114 @@ fun PlayerScreen(
         }
     }
 
-    // TrackSelector
-    val trackSelector = remember {
-        DefaultTrackSelector(context).apply {
-            // 1. 获取基础参数
-            val baseParameters = buildUponParameters()
-                .setPreferredTextLanguage("zh")
-                // 开启这个：允许尝试超出硬件声明能力的解码（对杜比 P7 至关重要）
-                .setExceedRendererCapabilitiesIfNecessary(true)
-                .build()
-
-            // 2. 动态判断隧道模式：仅在电视支持且非音频软解时开启
-            isTunnelingSafe = checkActualHardwareTunnelingSupport()
-
-            setParameters(
-                baseParameters.buildUpon()
-                    .setTunnelingEnabled(isTunnelingSafe)
+    // TrackSelector 构建函数（播放器重建时复用；copiedParameters 非空时直接继承原播放器参数）
+    fun createTrackSelector(copiedParameters: TrackSelectionParameters? = null): DefaultTrackSelector {
+        return DefaultTrackSelector(context).apply {
+            if (copiedParameters != null) {
+                setParameters(copiedParameters)
+            } else {
+                // 1. 获取基础参数
+                val baseParameters = buildUponParameters()
+                    .setPreferredTextLanguage("zh")
+                    // 开启这个：允许尝试超出硬件声明能力的解码（对杜比 P7 至关重要）
+                    .setExceedRendererCapabilitiesIfNecessary(true)
                     .build()
-            )
+
+                // 2. 动态判断隧道模式：仅在电视支持且非音频软解时开启
+                isTunnelingSafe = checkActualHardwareTunnelingSupport()
+
+                setParameters(
+                    baseParameters.buildUpon()
+                        .setTunnelingEnabled(isTunnelingSafe)
+                        .build()
+                )
+            }
         }
     }
 
 
-    val renderersFactory = DefaultRenderersFactory(context).apply {
-        // 1. 核心：增加解码器自动降级判断
-        setMediaCodecSelector { mimeType, requiresSecure, requiresTunneling ->
-            // 1. 获取默认解码器（如果是杜比视频，首选通常是 DV 解码器）
-            val dvDecoders =
-                MediaCodecUtil.getDecoderInfos(mimeType, requiresSecure, requiresTunneling)
-
-            if (mimeType == MimeTypes.VIDEO_DOLBY_VISION) {
-                // 2. 获取 HEVC 备选解码器
-                val hevcDecoders = MediaCodecUtil.getDecoderInfos(
-                    MimeTypes.VIDEO_H265,
-                    requiresSecure,
-                    requiresTunneling
-                )
-
-                // 3. 智能判断排序
-                val combined = ArrayList<MediaCodecInfo>()
-
-                // 检查是否有任何一个杜比解码器明确声称支持当前 Level/Profile
-                // Media3 会自动过滤掉完全不支持的，但对于 P7，很多电视报的是 "SUPPORT_UNKNOWN" 或功能受限
-                // 而且必须要有杜比视界的profile
-                val isHardwareLikelyToHandleDV =
-                    dvDecoders.any { it.hardwareAccelerated && !it.softwareOnly } && supportedDvProfiles.isNotEmpty()
-
-                if (isHardwareLikelyToHandleDV) {
-                    // 高性能电视：杜比优先，HEVC 垫后
-                    combined.addAll(dvDecoders)
-                    combined.addAll(hevcDecoders)
-                } else {
-                    // 低性能电视（或 DV 解码器缺失）：HEVC 优先，确保能播
-                    combined.addAll(hevcDecoders)
-                    combined.addAll(dvDecoders)
+    /**
+     * 构建渲染器工厂。
+     * 核心：按设备实际输出声道能力，在应用内把多声道 PCM 提前降混（如 5.1 → 2.0）再创建 AudioTrack，
+     * 避免触发部分电视固件在"系统级多声道降混"路径上的 AudioTrack 创建失败 bug（HAL 卡死需重启电视）。
+     * 设备真正支持多声道输出时不注册降混矩阵，行为与原生完全一致。
+     */
+    fun createRenderersFactory(): DefaultRenderersFactory {
+        val deviceMaxChannels =
+            AudioCapabilities.getCapabilities(context).maxChannelCount.coerceAtLeast(2)
+        val targetChannels = if (audioSafeModeChannels > 0) audioSafeModeChannels else deviceMaxChannels
+        Log.i(
+            AUDIO_RECOVERY_TAG,
+            "音频输出配置: 设备最大声道数=$deviceMaxChannels, 本次输出声道数=$targetChannels"
+        )
+        return object : DefaultRenderersFactory(context) {
+            override fun buildAudioSink(
+                context: Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean
+            ): AudioSink {
+                val channelMixer = ChannelMixingAudioProcessor()
+                // 只注册"超出目标声道数"的输入矩阵；不超过的格式（如立体声）处理器自动旁路
+                for (inputChannels in (targetChannels + 1)..8) {
+                    channelMixer.putChannelMixingMatrix(
+                        ChannelMixingMatrix.create(inputChannels, targetChannels)
+                    )
                 }
-                combined
-            } else {
-                dvDecoders
+                return DefaultAudioSink.Builder(context)
+                    .setEnableFloatOutput(enableFloatOutput)
+                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                    // 保留 Sonic（倍速支持）并前置声道降混处理器
+                    .setAudioProcessors(arrayOf(channelMixer, SonicAudioProcessor()))
+                    .build()
             }
-        }
+        }.apply {
+            // 1. 核心：增加解码器自动降级判断
+            setMediaCodecSelector { mimeType, requiresSecure, requiresTunneling ->
+                // 1. 获取默认解码器（如果是杜比视频，首选通常是 DV 解码器）
+                val dvDecoders =
+                    MediaCodecUtil.getDecoderInfos(mimeType, requiresSecure, requiresTunneling)
 
-        // 逻辑：ExoPlayer 会先扫描系统 MediaCodecList。
-        // 1. 如果电视硬件报支持该 Codec，优先用硬解。
-        // 2. 如果电视硬件不支持（如 TrueHD/DTS），则自动切换到你的 FFmpeg 扩展。
-        setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+                if (mimeType == MimeTypes.VIDEO_DOLBY_VISION) {
+                    // 2. 获取 HEVC 备选解码器
+                    val hevcDecoders = MediaCodecUtil.getDecoderInfos(
+                        MimeTypes.VIDEO_H265,
+                        requiresSecure,
+                        requiresTunneling
+                    )
+
+                    // 3. 智能判断排序
+                    val combined = ArrayList<MediaCodecInfo>()
+
+                    // 检查是否有任何一个杜比解码器明确声称支持当前 Level/Profile
+                    // Media3 会自动过滤掉完全不支持的，但对于 P7，很多电视报的是 "SUPPORT_UNKNOWN" 或功能受限
+                    // 而且必须要有杜比视界的profile
+                    val isHardwareLikelyToHandleDV =
+                        dvDecoders.any { it.hardwareAccelerated && !it.softwareOnly } && supportedDvProfiles.isNotEmpty()
+
+                    if (isHardwareLikelyToHandleDV) {
+                        // 高性能电视：杜比优先，HEVC 垫后
+                        combined.addAll(dvDecoders)
+                        combined.addAll(hevcDecoders)
+                    } else {
+                        // 低性能电视（或 DV 解码器缺失）：HEVC 优先，确保能播
+                        combined.addAll(hevcDecoders)
+                        combined.addAll(dvDecoders)
+                    }
+                    combined
+                } else {
+                    dvDecoders
+                }
+            }
+
+            // 逻辑：ExoPlayer 会先扫描系统 MediaCodecList。
+            // 1. 如果电视硬件报支持该 Codec，优先用硬解。
+            // 2. 如果电视硬件不支持（如 TrueHD/DTS），则自动切换到你的 FFmpeg 扩展。
+            setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
 //        setExtensionRendererMode(DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
 
-        // 这确保了渲染器能够处理复杂的字幕样式
-        setEnableDecoderFallback(true)
+            // 这确保了渲染器能够处理复杂的字幕样式
+            setEnableDecoderFallback(true)
+        }
     }
 
     // 同步检查并修复约束条件 - 在 loadControl 创建之前执行
@@ -293,32 +347,31 @@ fun PlayerScreen(
         preferencesManager.resetBufferDefaults()
     }
 
-    // 缓存控制配置 - 针对 TV 端视频流媒体优化
-    val loadControl =
-        remember(minBufferMs, maxBufferMs, playbackBufferMs, rebufferMs, bufferSizeBytes) {
-            val activityManager =
-                context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            val memoryClass = activityManager.memoryClass
-            val largeHeap = context.applicationInfo.flags and ApplicationInfo.FLAG_LARGE_HEAP != 0
+    // 缓存控制配置 - 针对 TV 端视频流媒体优化（构建函数，播放器重建时复用）
+    fun createLoadControl(): DefaultLoadControl {
+        val activityManager =
+            context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val memoryClass = activityManager.memoryClass
+        val largeHeap = context.applicationInfo.flags and ApplicationInfo.FLAG_LARGE_HEAP != 0
 
-            val targetBytes = when {
-                largeHeap || memoryClass >= 512 -> bufferSizeBytes.coerceAtLeast(256 * 1024 * 1024)
-                memoryClass >= 256 -> bufferSizeBytes.coerceAtLeast(128 * 1024 * 1024)
-                memoryClass >= 128 -> bufferSizeBytes.coerceAtLeast(64 * 1024 * 1024)
-                else -> bufferSizeBytes.coerceAtLeast(32 * 1024 * 1024)
-            }
-
-            DefaultLoadControl.Builder()
-                .setBufferDurationsMs(
-                    minBufferMs,
-                    maxBufferMs,
-                    playbackBufferMs,
-                    rebufferMs
-                )
-                .setTargetBufferBytes(targetBytes)
-                .setPrioritizeTimeOverSizeThresholds(true)
-                .build()
+        val targetBytes = when {
+            largeHeap || memoryClass >= 512 -> bufferSizeBytes.coerceAtLeast(256 * 1024 * 1024)
+            memoryClass >= 256 -> bufferSizeBytes.coerceAtLeast(128 * 1024 * 1024)
+            memoryClass >= 128 -> bufferSizeBytes.coerceAtLeast(64 * 1024 * 1024)
+            else -> bufferSizeBytes.coerceAtLeast(32 * 1024 * 1024)
         }
+
+        return DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                minBufferMs,
+                maxBufferMs,
+                playbackBufferMs,
+                rebufferMs
+            )
+            .setTargetBufferBytes(targetBytes)
+            .setPrioritizeTimeOverSizeThresholds(true)
+            .build()
+    }
 
     val bandwidthMeter = remember {
         DefaultBandwidthMeter.getSingletonInstance(context)
@@ -340,12 +393,12 @@ fun PlayerScreen(
     val mediaSourceFactory = DefaultMediaSourceFactory(context)
         .setDataSourceFactory(dataSourceFactory)
 
-    // ExoPlayer
-    val player = remember {
-        ExoPlayer.Builder(context, renderersFactory)
+    // ExoPlayer 构建函数（音频自动恢复时需要整体重建播放器）
+    fun buildPlayer(): ExoPlayer {
+        return ExoPlayer.Builder(context, createRenderersFactory())
             .setMediaSourceFactory(mediaSourceFactory)
-            .setTrackSelector(trackSelector)
-            .setLoadControl(loadControl)
+            .setTrackSelector(createTrackSelector())
+            .setLoadControl(createLoadControl())
             .setSeekBackIncrementMs(10000)
             .setSeekForwardIncrementMs(10000)
             .setAudioAttributes(
@@ -359,6 +412,52 @@ fun PlayerScreen(
             .build().apply {
                 playWhenReady = true // Ensure it tries to play immediately
             }
+    }
+
+    var player by remember { mutableStateOf(buildPlayer()) }
+
+    // ===== 音频故障自动恢复（全程自动，无用户交互）=====
+    // 0: 正常；1: 已用立体声安全模式重建过播放器；2: 已降级为无声播放
+    var audioRecoveryStage by remember { mutableIntStateOf(0) }
+    // 当前播放器实例是否出现过音频输出错误（播放器重建时自动重置）
+    var currentPlayerAudioError by remember { mutableStateOf(false) }
+
+    fun handleAudioSinkFailure() {
+        when (audioRecoveryStage) {
+            0 -> {
+                audioRecoveryStage = 1
+                audioSafeModeChannels = 2
+                Log.w(AUDIO_RECOVERY_TAG, "音频输出初始化失败，自动切换立体声安全模式并重建播放器")
+                val oldPlayer = player
+                val resumePositionMs = oldPlayer.currentPosition
+                val currentMediaItem = oldPlayer.currentMediaItem
+                val trackParameters = oldPlayer.trackSelectionParameters
+                oldPlayer.stop()
+                val newPlayer = buildPlayer()
+                if (currentMediaItem != null) {
+                    newPlayer.setMediaItem(currentMediaItem, resumePositionMs)
+                }
+                newPlayer.trackSelectionParameters = trackParameters
+                newPlayer.prepare()
+                newPlayer.playWhenReady = true
+                player = newPlayer // Compose 自动释放旧实例、重新绑定监听与画面
+            }
+            1 -> {
+                audioRecoveryStage = 2
+                Log.w(AUDIO_RECOVERY_TAG, "立体声安全模式仍无音频，自动转为无声播放（视频继续）")
+                val p = player
+                p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
+                    .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
+                    .build()
+                scope.launch {
+                    android.widget.Toast.makeText(
+                        context,
+                        context.getString(R.string.audio_output_degraded),
+                        android.widget.Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
     }
 
     var isBuffering by remember { mutableStateOf(true) } // Start true assuming we wait for load
@@ -378,8 +477,8 @@ fun PlayerScreen(
         }
     }
 
-    // 应用倍速
-    LaunchedEffect(playbackSpeed) {
+    // 应用倍速（player 重建后也需重新应用）
+    LaunchedEffect(player, playbackSpeed) {
         player.setPlaybackSpeed(playbackSpeed)
     }
 
@@ -853,6 +952,33 @@ fun PlayerScreen(
         }
     }
 
+    // 缓冲卡死看门狗：长时间缓冲且缓冲进度零增长时，若当前播放器存在音频输出错误则触发自动恢复；
+    // 同时把停滞的网速显示归零，避免一直显示冻结的加载速度
+    LaunchedEffect(player) {
+        var lastBufferedPosition = -1L
+        var lastChangeTime = System.currentTimeMillis()
+        while (isActive) {
+            delay(1000)
+            val p = player
+            val currentBuffered = p.bufferedPosition
+            if (currentBuffered != lastBufferedPosition) {
+                lastBufferedPosition = currentBuffered
+                lastChangeTime = System.currentTimeMillis()
+            } else {
+                downloadSpeed = 0
+                if (p.playbackState == Player.STATE_BUFFERING && !p.isPlaying &&
+                    currentBuffered > 0 &&
+                    System.currentTimeMillis() - lastChangeTime >= 15_000 &&
+                    currentPlayerAudioError && audioRecoveryStage < 2
+                ) {
+                    Log.w(AUDIO_RECOVERY_TAG, "检测到音频故障导致的缓冲卡死，触发自动恢复")
+                    handleAudioSinkFailure()
+                    lastChangeTime = System.currentTimeMillis()
+                }
+            }
+        }
+    }
+
     // 片头检测和自动跳过逻辑
     LaunchedEffect(isPlaying, position, introStartMs, introEndMs, autoSkipIntro, hasAutoSkipped) {
         if (introStartMs != null && introEndMs != null && isPlaying) {
@@ -882,7 +1008,9 @@ fun PlayerScreen(
 
     // 播放器监听
     DisposableEffect(player) {
-        player.addAnalyticsListener(object : AnalyticsListener {
+        val p = player
+        currentPlayerAudioError = false
+        p.addAnalyticsListener(object : AnalyticsListener {
 
             override fun onVideoDecoderInitialized(
                 eventTime: AnalyticsListener.EventTime,
@@ -899,8 +1027,19 @@ fun PlayerScreen(
                 initializedMs: Long,
                 initializationDurationMs: Long,
             ) {
-                // 例如 libffmpeg (如果用了FFmpeg扩展) 或 c2.android.ac3.decoder
-//                android.util.Log.d("DecoderInfo", "音频解码器已初始化: $decoderName")
+                Log.i("DecoderInfo", "音频解码器已初始化: $decoderName")
+            }
+
+            override fun onAudioSinkError(
+                eventTime: AnalyticsListener.EventTime,
+                audioSinkException: Exception,
+            ) {
+                Log.e(
+                    AUDIO_RECOVERY_TAG,
+                    "音频输出错误(stage=$audioRecoveryStage): ${audioSinkException.message}"
+                )
+                currentPlayerAudioError = true
+                handleAudioSinkFailure()
             }
         })
 
@@ -916,7 +1055,7 @@ fun PlayerScreen(
 
             override fun onTimelineChanged(timeline: Timeline, reason: Int) {
                 if (reason == Player.TIMELINE_CHANGE_REASON_SOURCE_UPDATE) {
-                    val durationMs = player.duration // 此时时长已可用
+                    val durationMs = p.duration // 此时时长已可用
                     if (durationMs != C.TIME_UNSET) {
                         // 执行逻辑
                         duration = durationMs
@@ -930,11 +1069,14 @@ fun PlayerScreen(
                 } else if (state == Player.STATE_READY) {
                     isBuffering = false
                     // 在STATE_READY时获取准确时长
-                    val rawDuration = player.duration
+                    val rawDuration = p.duration
                     if (rawDuration > 0) {
                         duration = rawDuration
                         Log.d("Player", "Duration updated from READY state: $duration ms")
                     }
+                } else if (state == Player.STATE_IDLE) {
+                    // 出错/停止后的空闲态：清掉缓冲指示，避免永远转圈
+                    isBuffering = false
                 }
 
 
@@ -943,8 +1085,8 @@ fun PlayerScreen(
                     onPlaybackStateChanged(false)
                     // Handle loop logic
                     if (playMode == 1) { // Single Loop
-                        player.seekTo(0)
-                        player.play()
+                        p.seekTo(0)
+                        p.play()
                     } else if (playMode == 0) { // List Loop
 
                         val seriesId = mediaInfo.seriesId
@@ -1022,11 +1164,20 @@ fun PlayerScreen(
             Handler(Looper.getMainLooper()),
             bandwidthListener
         )
-        player.addListener(listener)
+        p.addListener(listener)
 
         onDispose {
             bandwidthMeter.removeEventListener(bandwidthListener)
-            // 发送停止报告
+            p.stop()
+            p.removeListener(listener)
+            p.setVideoSurface(null)
+            p.release()
+        }
+    }
+
+    // 退出播放页时上报停止（与播放器实例重建解耦，音频自动恢复重建时不会误报）
+    DisposableEffect(Unit) {
+        onDispose {
             playerViewModel.reportStopped(
                 mediaId = mediaId,
                 media = media,
@@ -1035,10 +1186,6 @@ fun PlayerScreen(
                 selectedAudioIndex = selectedAudioIndex,
                 playbackRate = playbackSpeed
             )
-            player.stop()
-            player.removeListener(listener)
-            player.setVideoSurface(null)
-            player.release()
         }
     }
 
