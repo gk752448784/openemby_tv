@@ -3,6 +3,7 @@ package com.xxxx.emby_tv.ui
 import android.app.ActivityManager
 import android.content.Context
 import android.content.pm.ApplicationInfo
+import android.media.AudioManager
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -112,6 +113,62 @@ private const val SUBTITLE_TOP_RESERVED_FRACTION = 0.12f
 // 重启 APP 后自动重试原生多声道。
 private var audioSafeModeChannels = -1
 private const val AUDIO_RECOVERY_TAG = "AudioRecovery"
+
+/**
+ * 手写声道混合矩阵。不使用 ChannelMixingMatrix.create()：
+ * 它只实现了少数组合（如 6->2、8->2），对 3->2、4->2、5->2、7->2 等会直接抛
+ * UnsupportedOperationException（曾导致进入播放页即闪退）。
+ *
+ * 一维系数数组布局（由 media3 源码确认）：coefficients[inputChannel * outputChannelCount + outputChannel]
+ *
+ * @param inputChannels 输入声道数 (1..8)
+ * @param outputChannels 输出声道数，小于输入声道数时执行降混
+ */
+private fun buildChannelMixingMatrix(inputChannels: Int, outputChannels: Int): ChannelMixingMatrix {
+    val coefficients: FloatArray = if (inputChannels == outputChannels) {
+        // 恒等矩阵
+        FloatArray(inputChannels * outputChannels).also { c ->
+            for (ch in 0 until inputChannels) c[ch * outputChannels + ch] = 1f
+        }
+    } else if (outputChannels == 2) {
+        // 降混到立体声。各声道数的标准 WAV 声道序：
+        // 3:FL,FR,FC  4:FL,FR,BL,BR  5:FL,FR,FC,BL,BR  6:FL,FR,FC,LFE,BL,BR
+        // 7:FL,FR,FC,LFE,BC,SL,SR  8:FL,FR,FC,LFE,BL,BR,SL,SR
+        // 约定（同 ITU-R/系统降混）：FL/FR 直通，FC 双侧 0.707，LFE 丢弃，
+        // BL/SL 折叠到 FL，BR/SR 折叠到 FR，BC 双侧 0.707
+        val g = 0.70710678f
+        val toStereo: Array<Pair<Float, Float>> = when (inputChannels) {
+            1 -> arrayOf(1f to 1f)
+            3 -> arrayOf(1f to 0f, 0f to 1f, g to g)
+            4 -> arrayOf(1f to 0f, 0f to 1f, g to 0f, 0f to g)
+            5 -> arrayOf(1f to 0f, 0f to 1f, g to g, g to 0f, 0f to g)
+            6 -> arrayOf(1f to 0f, 0f to 1f, g to g, 0f to 0f, g to 0f, 0f to g)
+            7 -> arrayOf(1f to 0f, 0f to 1f, g to g, 0f to 0f, g to g, g to 0f, 0f to g)
+            8 -> arrayOf(1f to 0f, 0f to 1f, g to g, 0f to 0f, g to 0f, 0f to g, g to 0f, 0f to g)
+            else -> Array(inputChannels) { i ->
+                when (i) {
+                    0 -> 1f to 0f
+                    1 -> 0f to 1f
+                    2 -> g to g   // FC
+                    3 -> 0f to 0f // LFE
+                    else -> if (i % 2 == 0) g to 0f else 0f to g
+                }
+            }
+        }
+        FloatArray(inputChannels * 2).also { c ->
+            toStereo.forEachIndexed { i, pair ->
+                c[i * 2] = pair.first      // 输入声道 i → 输出 FL
+                c[i * 2 + 1] = pair.second // 输入声道 i → 输出 FR
+            }
+        }
+    } else {
+        // 罕见组合（输入 > 输出 >= 3）：前 outputChannels 路恒等，多余声道丢弃
+        FloatArray(inputChannels * outputChannels).also { c ->
+            for (ch in 0 until outputChannels) c[ch * outputChannels + ch] = 1f
+        }
+    }
+    return ChannelMixingMatrix(inputChannels, outputChannels, coefficients)
+}
 @androidx.annotation.OptIn(UnstableApi::class)
 @OptIn(ExperimentalTvMaterial3Api::class)
 @Composable
@@ -254,17 +311,33 @@ fun PlayerScreen(
 
     /**
      * 构建渲染器工厂。
-     * 核心：按设备实际输出声道能力，在应用内把多声道 PCM 提前降混（如 5.1 → 2.0）再创建 AudioTrack，
+     * 核心：把多声道 PCM 在应用内降混到设备实际支持的输出声道数（如 5.1 → 2.0）再创建 AudioTrack，
      * 避免触发部分电视固件在"系统级多声道降混"路径上的 AudioTrack 创建失败 bug（HAL 卡死需重启电视）。
-     * 设备真正支持多声道输出时不注册降混矩阵，行为与原生完全一致。
+     *
+     * 注意：AudioCapabilities.maxChannelCount 会把直通（DD+/Atmos bitstream）能力也算进去，
+     * 在部分电视上严重虚高（实测 TCL 报 10），因此以 AudioDeviceInfo 上各输出设备的
+     * 实际 PCM 声道数为准，两者取小。
      */
     fun createRenderersFactory(): DefaultRenderersFactory {
-        val deviceMaxChannels =
-            AudioCapabilities.getCapabilities(context).maxChannelCount.coerceAtLeast(2)
-        val targetChannels = if (audioSafeModeChannels > 0) audioSafeModeChannels else deviceMaxChannels
+        val reportedMaxChannels =
+            AudioCapabilities.getCapabilities(context).maxChannelCount.coerceIn(2, 8)
+        val audioManager =
+            context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val devicePcmChannels = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+            .flatMap { device -> device.channelCounts.toList() }
+            .filter { it in 2..8 }
+            .distinct()
+            .sorted()
+        val capableChannels = if (devicePcmChannels.isNotEmpty()) {
+            minOf(reportedMaxChannels, devicePcmChannels.last())
+        } else {
+            reportedMaxChannels
+        }
+        val targetChannels = if (audioSafeModeChannels > 0) audioSafeModeChannels else capableChannels
         Log.i(
             AUDIO_RECOVERY_TAG,
-            "音频输出配置: 设备最大声道数=$deviceMaxChannels, 本次输出声道数=$targetChannels"
+            "音频输出配置: 上报最大声道数=$reportedMaxChannels, 设备实测PCM声道=$devicePcmChannels, " +
+                "可用声道数=$capableChannels, 目标输出声道数=$targetChannels"
         )
         return object : DefaultRenderersFactory(context) {
             override fun buildAudioSink(
@@ -272,19 +345,32 @@ fun PlayerScreen(
                 enableFloatOutput: Boolean,
                 enableAudioTrackPlaybackParams: Boolean
             ): AudioSink {
-                val channelMixer = ChannelMixingAudioProcessor()
-                // 只注册"超出目标声道数"的输入矩阵；不超过的格式（如立体声）处理器自动旁路
-                for (inputChannels in (targetChannels + 1)..8) {
-                    channelMixer.putChannelMixingMatrix(
-                        ChannelMixingMatrix.create(inputChannels, targetChannels)
-                    )
+                return try {
+                    val channelMixer = ChannelMixingAudioProcessor()
+                    // 全量注册 1..8 声道矩阵：超出目标的降混，未超出的恒等通过。
+                    // 必须保证任何 PCM 输入都有矩阵，否则 media3 会抛 UnhandledAudioFormatException
+                    // 并升级为致命播放错误（黑屏）。
+                    for (inputChannels in 1..8) {
+                        val outputChannels =
+                            if (inputChannels > targetChannels) targetChannels else inputChannels
+                        channelMixer.putChannelMixingMatrix(
+                            buildChannelMixingMatrix(inputChannels, outputChannels)
+                        )
+                    }
+                    DefaultAudioSink.Builder(context)
+                        .setEnableFloatOutput(enableFloatOutput)
+                        .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                        // 保留 Sonic（倍速支持）并前置声道降混处理器
+                        .setAudioProcessors(arrayOf(channelMixer, SonicAudioProcessor()))
+                        .build()
+                } catch (e: Exception) {
+                    // 兜底：任何矩阵/构建异常都回落到原生 sink，绝不影响进入播放页
+                    Log.e(AUDIO_RECOVERY_TAG, "构建降混音频管线失败，回落原生输出", e)
+                    DefaultAudioSink.Builder(context)
+                        .setEnableFloatOutput(enableFloatOutput)
+                        .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                        .build()
                 }
-                return DefaultAudioSink.Builder(context)
-                    .setEnableFloatOutput(enableFloatOutput)
-                    .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
-                    // 保留 Sonic（倍速支持）并前置声道降混处理器
-                    .setAudioProcessors(arrayOf(channelMixer, SonicAudioProcessor()))
-                    .build()
             }
         }.apply {
             // 1. 核心：增加解码器自动降级判断
@@ -1140,6 +1226,25 @@ fun PlayerScreen(
                             android.widget.Toast.LENGTH_LONG
                         ).show()
                     }
+                    return
+                }
+                // 音频输出类错误 → 交给音频自动恢复（安全模式重建/无声降级），不消耗一次性的转码回退
+                val isAudioTrackError =
+                    error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_WRITE_FAILED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_OFFLOAD_INIT_FAILED ||
+                        error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_OFFLOAD_WRITE_FAILED ||
+                        generateSequence<Throwable>(error.cause) { it.cause }.any {
+                            it is AudioSink.InitializationException ||
+                                it is AudioSink.ConfigurationException ||
+                                it is AudioSink.WriteException
+                        }
+                if (isAudioTrackError) {
+                    Log.w(
+                        AUDIO_RECOVERY_TAG,
+                        "播放错误为音频输出类(code=${error.errorCode})，触发音频自动恢复"
+                    )
+                    handleAudioSinkFailure()
                     return
                 }
                 fallbackToServerTranscode()
