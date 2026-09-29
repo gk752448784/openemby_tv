@@ -75,9 +75,9 @@ object HttpClient {
                 maxRequests = 64
                 maxRequestsPerHost = 20
             })
-            .connectionPool(ConnectionPool(10, 2, TimeUnit.MINUTES))
-            .connectTimeout(6, TimeUnit.SECONDS)
-            .readTimeout(6, TimeUnit.SECONDS)
+            .connectionPool(ConnectionPool(10, 5, TimeUnit.MINUTES)) // 远程代理场景延长保活，减少重建握手
+            .connectTimeout(20, TimeUnit.SECONDS) // 代理握手 + 远程连接两段延迟，6s 不够
+            .readTimeout(40, TimeUnit.SECONDS)   // 大响应体（PlaybackInfo）在慢速代理下需要更长时间
             .retryOnConnectionFailure(true)
 
         if (config.enabled && config.host.isNotEmpty()) {

@@ -737,13 +737,23 @@ fun PlayerScreen(
                     media.playSessionId
                 )
             }
-            val mediaResult = repository.getPlaybackInfo(
-                mediaId,
-                if (position > 0) position * 10000 else playbackPositionTicks,
-                requestAudioIndex,
-                requestSubtitleIndex,
-                hasTriedTranscodeFallback || playbackCorrection == 1
-            )
+
+            // 远程代理场景优化：并发发起两个请求，总耗时 = max(两者) 而非 sum(两者)
+            val (mediaResult, mediaInfoResult) = kotlinx.coroutines.coroutineScope {
+                val playbackInfoDeferred = async(Dispatchers.IO) {
+                    repository.getPlaybackInfo(
+                        mediaId,
+                        if (position > 0) position * 10000 else playbackPositionTicks,
+                        requestAudioIndex,
+                        requestSubtitleIndex,
+                        hasTriedTranscodeFallback || playbackCorrection == 1
+                    )
+                }
+                val mediaInfoDeferred = async(Dispatchers.IO) {
+                    repository.getMediaInfo(mediaId)
+                }
+                playbackInfoDeferred.await() to mediaInfoDeferred.await()
+            }
 
             if (mediaResult.mediaSources.isNullOrEmpty()) {
                 withContext(kotlinx.coroutines.Dispatchers.Main) {
@@ -758,7 +768,6 @@ fun PlayerScreen(
 
             // 直接使用 mediaResult 对象，赋值给状态
             media = mediaResult
-            val mediaInfoResult = repository.getMediaInfo(mediaId)
             mediaInfo = mediaInfoResult
 
             // 更新收藏状态
