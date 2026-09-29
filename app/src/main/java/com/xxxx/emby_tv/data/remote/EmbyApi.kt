@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Point
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
+import android.net.Uri
 import android.os.Build
 import android.util.Log
 import android.view.WindowManager
@@ -18,7 +19,9 @@ import com.xxxx.emby_tv.data.model.AuthenticationResultDto
 import com.xxxx.emby_tv.data.model.BaseItemDto
 import com.xxxx.emby_tv.data.model.EmbyResponseDto
 import com.xxxx.emby_tv.data.model.MediaDto
+import com.xxxx.emby_tv.data.model.RemoteSubtitleInfo
 import com.xxxx.emby_tv.data.model.SessionDto
+import com.xxxx.emby_tv.data.model.SubtitleDownloadResult
 import com.xxxx.emby_tv.util.ErrorHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -305,6 +308,41 @@ object EmbyApi {
     }
 
     // ==================== 播放相关 ====================
+
+    suspend fun searchRemoteSubtitles(
+        context: Context,
+        serverUrl: String,
+        apiKey: String,
+        deviceId: String,
+        mediaId: String,
+        mediaSourceId: String?,
+        language: String
+    ): List<RemoteSubtitleInfo> {
+        val sourceParam = mediaSourceId?.let { "&MediaSourceId=${Uri.encode(it)}" } ?: ""
+        val url = "/Items/${Uri.encode(mediaId)}/RemoteSearch/Subtitles/${Uri.encode(language)}" +
+                "?X-Emby-Token=${Uri.encode(apiKey)}$sourceParam"
+        return httpStream(context, serverUrl, apiKey, deviceId, url) { reader ->
+            val type = object : TypeToken<List<RemoteSubtitleInfo>>() {}.type
+            gson.fromJson<List<RemoteSubtitleInfo>>(reader, type) ?: emptyList()
+        }
+    }
+
+    suspend fun downloadRemoteSubtitle(
+        context: Context,
+        serverUrl: String,
+        apiKey: String,
+        deviceId: String,
+        mediaId: String,
+        mediaSourceId: String?,
+        subtitleId: String
+    ): SubtitleDownloadResult {
+        val sourceParam = mediaSourceId?.let { "&MediaSourceId=${Uri.encode(it)}" } ?: ""
+        val url = "/Items/${Uri.encode(mediaId)}/RemoteSearch/Subtitles/${Uri.encode(subtitleId)}" +
+                "?X-Emby-Token=${Uri.encode(apiKey)}$sourceParam"
+        return httpStream(context, serverUrl, apiKey, deviceId, url, "POST") { reader ->
+            gson.fromJson(reader, SubtitleDownloadResult::class.java) ?: SubtitleDownloadResult()
+        }
+    }
 
     /**
      * 获取播放信息

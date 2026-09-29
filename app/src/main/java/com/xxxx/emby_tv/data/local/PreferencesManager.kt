@@ -209,8 +209,8 @@ class PreferencesManager(context: Context) {
         const val DEFAULT_SUBTITLE_BOTTOM_PADDING = 0.08f
         const val DEFAULT_MIN_BUFFER_MS = 45_000
         const val DEFAULT_MAX_BUFFER_MS = 120_000
-        const val DEFAULT_PLAYBACK_BUFFER_MS = 3_000
-        const val DEFAULT_REBUFFER_MS = 5_000
+        const val DEFAULT_PLAYBACK_BUFFER_MS = 1_000
+        const val DEFAULT_REBUFFER_MS = 2_500
         const val DEFAULT_BUFFER_SIZE_BYTES = 134_217_728 // 128MB
     }
 }

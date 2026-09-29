@@ -49,7 +49,7 @@ object PlayerTrackManager {
             }
 
         val targetOrdinalIndex = subtitleTracks.indexOf(targetTrack)
-        val targetLabel = targetTrack.displayTitle
+        val targetLabel = targetTrack.displayTitle ?: "Subtitle"
         val targetIndex = targetTrack.index?.toString() ?: ""
         val isLoadedViaConfig = targetTrack.supportsExternalStream == true || targetTrack.isExternal == true
 
@@ -107,7 +107,23 @@ object PlayerTrackManager {
 //            }
 //        }
 
-        // 策略2：顺序匹配（用于直接播放的内嵌字幕）
+        // 外置字幕配置使用唯一标签，避免下载新字幕后列表顺序与 Media3 轨道顺序不一致。
+        if (targetTrack.isExternal == true) {
+            val uniqueTargetLabel = "$targetLabel [$targetIndex]"
+            outerLabel@ for (group in trackGroups) {
+                for (i in 0 until group.length) {
+                    if (group.getTrackFormat(i).label == uniqueTargetLabel) {
+                        parametersBuilder.setOverrideForType(
+                            TrackSelectionOverride(group.mediaTrackGroup, i)
+                        )
+                        isMatched = true
+                        break@outerLabel
+                    }
+                }
+            }
+        }
+
+        // 策略2：顺序匹配（兼容现有轨道）
         if (!isMatched && isLoadedViaConfig && targetOrdinalIndex >= 0) {
             var trackCounter = 0
             outerOrdinal@ for (group in trackGroups) {

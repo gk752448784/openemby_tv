@@ -5,6 +5,7 @@ import com.xxxx.emby_tv.data.remote.EmbyApi
 import com.xxxx.emby_tv.data.session.SessionManager
 import com.xxxx.emby_tv.data.model.BaseItemDto
 import com.xxxx.emby_tv.data.model.MediaDto
+import com.xxxx.emby_tv.data.model.RemoteSubtitleInfo
 import com.xxxx.emby_tv.data.model.SessionDto
 
 /**
@@ -247,6 +248,30 @@ class EmbyRepository private constructor(private val context: Context) {
     }
 
     // === 播放 ===
+
+    suspend fun searchRemoteSubtitles(
+        mediaId: String,
+        mediaSourceId: String?,
+        language: String
+    ): List<RemoteSubtitleInfo> {
+        requireLoggedIn()
+        return EmbyApi.searchRemoteSubtitles(
+            context, session.serverUrl!!, session.apiKey!!, session.deviceId,
+            mediaId, mediaSourceId, language
+        )
+    }
+
+    suspend fun downloadRemoteSubtitle(
+        mediaId: String,
+        mediaSourceId: String?,
+        subtitleId: String
+    ): Int {
+        requireLoggedIn()
+        return EmbyApi.downloadRemoteSubtitle(
+            context, session.serverUrl!!, session.apiKey!!, session.deviceId,
+            mediaId, mediaSourceId, subtitleId
+        ).newIndex ?: throw IllegalStateException("Emby did not return NewIndex")
+    }
 
     /**
      * 获取播放信息

@@ -50,10 +50,12 @@ private const val SUBTITLE_SYNC_MAX_STEPS = 120
 fun PlayerMenu(
     onDismiss: () -> Unit,
     media: MediaDto,
+    mediaId: String,
     mediaInfo: BaseItemDto,
     subtitleTracks: List<MediaStreamDto>,
     selectedSubtitleIndex: Int,
     onSubtitleSelect: (Int) -> Unit,
+    onOnlineSubtitleDownloaded: suspend (Int) -> Unit,
     audioTracks: List<MediaStreamDto>,
     selectedAudioIndex: Int,
     onAudioSelect: (Int) -> Unit,
@@ -100,6 +102,7 @@ fun PlayerMenu(
         list.add("Info") // 0 or 1
         list.add("Speed") // 倍速
         list.add("Subtitles") // 2 or 1
+        list.add("OnlineSubtitles")
         list.add("Audio") // 3 or 2
         if (isSeries) list.add("Mode")
         list.add("Correction") // ...
@@ -152,6 +155,7 @@ fun PlayerMenu(
                                 "Episodes" -> stringResource(R.string.episodes)
                                 "Speed" -> stringResource(R.string.playback_speed)
                                 "Subtitles" -> stringResource(R.string.subtitles)
+                                "OnlineSubtitles" -> stringResource(R.string.online_subtitles)
                                 "Audio" -> stringResource(R.string.audio_label)
                                 "Mode" -> stringResource(R.string.play_mode)
                                 "Correction" -> stringResource(R.string.playback_correction)
@@ -213,6 +217,16 @@ fun PlayerMenu(
                                 onSubtitleBottomPaddingChange,
                                 subtitleTimeOffsetMs,
                                 onSubtitleTimeOffsetChange
+                            )
+
+                            "OnlineSubtitles" -> OnlineSubtitlesTab(
+                                mediaId = mediaId,
+                                mediaSourceId = media.mediaSources?.firstOrNull()?.id,
+                                repository = repository,
+                                onDownloaded = { index ->
+                                    onOnlineSubtitleDownloaded(index)
+                                    onDismiss()
+                                }
                             )
 
                             "Audio" -> AudioTab(audioTracks, selectedAudioIndex, onAudioSelect)

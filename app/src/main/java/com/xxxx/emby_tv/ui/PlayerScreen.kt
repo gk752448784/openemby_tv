@@ -48,6 +48,7 @@ import androidx.media3.common.audio.ChannelMixingMatrix
 import androidx.media3.common.audio.SonicAudioProcessor
 import androidx.media3.common.text.CueGroup
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.SeekParameters
 import androidx.media3.exoplayer.audio.AudioCapabilities
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
@@ -486,6 +487,7 @@ fun PlayerScreen(
             .setMediaSourceFactory(mediaSourceFactory)
             .setTrackSelector(createTrackSelector())
             .setLoadControl(createLoadControl())
+            .setSeekParameters(SeekParameters.CLOSEST_SYNC)
             .setSeekBackIncrementMs(10000)
             .setSeekForwardIncrementMs(10000)
             .setAudioAttributes(
@@ -824,7 +826,7 @@ fun PlayerScreen(
     }
 
     // 设置 MediaItem 和 字幕
-    LaunchedEffect(videoUrl) {
+    LaunchedEffect(videoUrl, subtitleTracks) {
         if (videoUrl != null) {
             val source = media.mediaSources?.firstOrNull()
             val mediaSourceId = source?.id ?: ""
@@ -913,6 +915,7 @@ fun PlayerScreen(
     }
 
     // Session Reporting & Updates - 使用 playerViewModel 定期报告进度
+    val currentPlaybackSpeed by rememberUpdatedState(playbackSpeed)
     LaunchedEffect(isPlaying) {
         if (isPlaying) {
             var tickCount = 0
@@ -925,7 +928,8 @@ fun PlayerScreen(
                             media = media,
                             position = position,
                             selectedSubtitleIndex = selectedSubtitleIndex,
-                            selectedAudioIndex = selectedAudioIndex
+                            selectedAudioIndex = selectedAudioIndex,
+                            playbackRate = currentPlaybackSpeed
                         )
                     }
                     tickCount++
@@ -1579,11 +1583,43 @@ fun PlayerScreen(
                 PlayerMenu(
                     onDismiss = { showMenu = false },
                     media = media,
+                    mediaId = mediaId,
                     mediaInfo = mediaInfo,
                     subtitleTracks = subtitleTracks,
                     selectedSubtitleIndex = selectedSubtitleIndex,
                     onSubtitleSelect = { index ->
                         changeTrack(selectedAudioIndex, index)
+                    },
+                    onOnlineSubtitleDownloaded = { newIndex ->
+                        val resumePosition = player.currentPosition.coerceAtLeast(0L)
+                        val currentSourceId = media.mediaSources?.firstOrNull()?.id
+                        val refreshed = repository.getPlaybackInfo(
+                            mediaId,
+                            resumePosition * 10000,
+                            selectedAudioIndex.takeIf { it >= 0 },
+                            newIndex,
+                            hasTriedTranscodeFallback || playbackCorrection == 1
+                        )
+                        val source = refreshed.mediaSources?.firstOrNull()
+                            ?: throw IllegalStateException(context.getString(R.string.failed_get_playback_info))
+                        if (source.id != currentSourceId) {
+                            throw IllegalStateException(context.getString(R.string.online_subtitle_not_ready))
+                        }
+                        val refreshedSubtitles = source.mediaStreams?.filter { it.type == "Subtitle" } ?: emptyList()
+                        if (refreshedSubtitles.none { it.index == newIndex }) {
+                            throw IllegalStateException(context.getString(R.string.online_subtitle_not_ready))
+                        }
+                        val path = if (playbackCorrection == 1) {
+                            source.transcodingUrl ?: source.directStreamUrl
+                        } else {
+                            source.directStreamUrl ?: source.transcodingUrl
+                        } ?: throw IllegalStateException(context.getString(R.string.failed_get_playback_info))
+                        position = resumePosition
+                        media = refreshed
+                        subtitleTracks = refreshedSubtitles
+                        audioTracks = source.mediaStreams?.filter { it.type == "Audio" } ?: emptyList()
+                        selectedSubtitleIndex = newIndex
+                        videoUrl = "${serverUrl}/emby$path"
                     },
                     audioTracks = audioTracks,
                     selectedAudioIndex = selectedAudioIndex,
@@ -1718,4 +1754,3 @@ fun PlayerScreen(
         }
     } // 最外层纯黑背景 Box 闭合
 }
-

@@ -33,7 +33,7 @@ object HttpClient {
 
     private fun getCache(context: Context): Cache {
         return cache ?: synchronized(this) {
-            cache ?: Cache(File(context.cacheDir, "http_cache"), 10 * 1024 * 1024).also { cache = it }
+            cache ?: Cache(File(context.cacheDir, "http_cache"), 250L * 1024 * 1024).also { cache = it }
         }
     }
 
@@ -68,6 +68,20 @@ object HttpClient {
         }
     }
 
+    private fun isLocalAddress(host: String): Boolean {
+        if (host.equals("localhost", ignoreCase = true) || host == "127.0.0.1" || host == "::1") return true
+        if (host.endsWith(".local", ignoreCase = true)) return true
+        if (host.startsWith("192.168.") || host.startsWith("10.")) return true
+        if (host.startsWith("172.")) {
+            val parts = host.split(".")
+            if (parts.size >= 2) {
+                val second = parts[1].toIntOrNull()
+                if (second != null && second in 16..31) return true
+            }
+        }
+        return false
+    }
+
     private fun createClient(context: Context, config: ProxyConfig): OkHttpClient {
         val builder = OkHttpClient.Builder()
             .cache(getCache(context))
@@ -87,19 +101,16 @@ object HttpClient {
                 Proxy(Proxy.Type.HTTP, InetSocketAddress.createUnresolved(config.host, config.port))
             }
 
-            val embyHost = extractEmbyHost(context)
-
             builder.proxySelector(object : ProxySelector() {
                 override fun select(uri: URI): List<Proxy> {
                     return try {
                         val host = uri.host ?: return listOf(Proxy.NO_PROXY)
-                        if (host == "127.0.0.1" || host == "localhost" || host == "::1") {
+                        // 本地及局域网请求（如 LocalServer 扫码登录、局域网设备）走直连
+                        if (isLocalAddress(host)) {
                             return listOf(Proxy.NO_PROXY)
                         }
-                        if (embyHost.isNotEmpty() && host.equals(embyHost, ignoreCase = true)) {
-                            return listOf(proxy)
-                        }
-                        listOf(Proxy.NO_PROXY)
+                        // 其余所有远程请求（Emby API、302 跳转的媒体流、海报等）统一走代理
+                        listOf(proxy)
                     } catch (e: Exception) {
                         Log.e(TAG, "ProxySelector.select error", e)
                         listOf(Proxy.NO_PROXY)
@@ -129,18 +140,6 @@ object HttpClient {
         }
 
         return builder.build()
-    }
-
-    private fun extractEmbyHost(context: Context): String {
-        return try {
-            val prefs = context.getSharedPreferences("emby_tv", Context.MODE_PRIVATE)
-            val serverUrl = prefs.getString("serverUrl", "") ?: ""
-            if (serverUrl.isNotEmpty()) {
-                URL(serverUrl).host ?: ""
-            } else ""
-        } catch (e: Exception) {
-            ""
-        }
     }
 
     fun rebuildClient(context: Context) {

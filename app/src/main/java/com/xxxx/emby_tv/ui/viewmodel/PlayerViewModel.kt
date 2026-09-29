@@ -23,6 +23,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 // 定义一个全局的静态变量作为内存缓存
+@Volatile
 private var cachedDvProfiles: List<DvProfileInfo>? = null
 /**
  * 播放器 ViewModel
@@ -174,12 +175,13 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         position: Long,
         selectedSubtitleIndex: Int,
         selectedAudioIndex: Int,
+        playbackRate: Float,
         isPaused: Boolean = false
     ) {
-        Log.e("reportProgress position", position.toString())
+        Log.d("PlayerViewModel", "reportProgress position: $position")
         viewModelScope.launch(Dispatchers.IO + NonCancellable) {
             try {
-                val body = buildProgressBody(mediaId, media, position, selectedSubtitleIndex, selectedAudioIndex, isPaused)
+                val body = buildProgressBody(mediaId, media, position, selectedSubtitleIndex, selectedAudioIndex, playbackRate, isPaused)
                 repository.reportPlaybackProgress(body)
             } catch (e: Exception) {
                 ErrorHandler.logError("PlayerViewModel", "操作失败", e)
@@ -198,7 +200,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         selectedAudioIndex: Int,
         playbackRate: Float = 1.0f
     ) {
-        Log.e("reportStopped position", position.toString())
+        Log.d("PlayerViewModel", "reportStopped position: $position")
         viewModelScope.launch(Dispatchers.IO + NonCancellable) {
             try {
                 val body = buildStoppedBody(mediaId, media, position, selectedSubtitleIndex, selectedAudioIndex, playbackRate)
@@ -263,13 +265,15 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
 
     // === 构建请求体 ===
 
-    private fun buildPlayingBody(
+    private fun buildBasePlaybackBody(
         mediaId: String,
         media: MediaDto,
         position: Long,
         selectedSubtitleIndex: Int,
         selectedAudioIndex: Int,
-        playbackRate: Float = 1.0f
+        isPaused: Boolean,
+        playbackRate: Float = 1.0f,
+        eventName: String? = null
     ): Map<String, Any?> {
         val ticks = position * 10000
         val playMethod = Utils.determinePlayMethod(media)
@@ -278,10 +282,10 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         val runTimeTicks = firstSource?.runTimeTicks ?: 0L
         val mediaSourceId = firstSource?.id ?: ""
 
-        return mapOf(
+        val map = mutableMapOf<String, Any?>(
             "VolumeLevel" to 100,
             "IsMuted" to false,
-            "IsPaused" to false,
+            "IsPaused" to isPaused,
             "RepeatMode" to "RepeatNone",
             "Shuffle" to false,
             "SubtitleOffset" to 0,
@@ -301,7 +305,28 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
             "CanSeek" to true,
             "ItemId" to mediaId
         )
+        if (eventName != null) {
+            map["EventName"] = eventName
+        }
+        return map
     }
+
+    private fun buildPlayingBody(
+        mediaId: String,
+        media: MediaDto,
+        position: Long,
+        selectedSubtitleIndex: Int,
+        selectedAudioIndex: Int,
+        playbackRate: Float = 1.0f
+    ): Map<String, Any?> = buildBasePlaybackBody(
+        mediaId = mediaId,
+        media = media,
+        position = position,
+        selectedSubtitleIndex = selectedSubtitleIndex,
+        selectedAudioIndex = selectedAudioIndex,
+        isPaused = false,
+        playbackRate = playbackRate
+    )
 
     private fun buildProgressBody(
         mediaId: String,
@@ -309,36 +334,18 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         position: Long,
         selectedSubtitleIndex: Int,
         selectedAudioIndex: Int,
+        playbackRate: Float,
         isPaused: Boolean
-    ): Map<String, Any?> {
-        val ticks = position * 10000
-        val playMethod = Utils.determinePlayMethod(media)
-        val mediaSources = media.mediaSources
-        val firstSource = mediaSources?.firstOrNull()
-        val runTimeTicks = firstSource?.runTimeTicks ?: 0L
-        val mediaSourceId = firstSource?.id ?: ""
-
-        return mapOf(
-            "VolumeLevel" to 100,
-            "IsMuted" to false,
-            "IsPaused" to isPaused,
-            "RepeatMode" to "RepeatNone",
-            "PositionTicks" to ticks,
-            "PlaybackStartTimeTicks" to System.currentTimeMillis() * 10000,
-            "SubtitleStreamIndex" to selectedSubtitleIndex,
-            "AudioStreamIndex" to selectedAudioIndex,
-            "BufferedRanges" to emptyList<Any>(),
-            "SeekableRanges" to listOf(
-                mapOf("start" to 0, "end" to runTimeTicks)
-            ),
-            "PlayMethod" to playMethod,
-            "PlaySessionId" to (media.playSessionId ?: ""),
-            "MediaSourceId" to mediaSourceId,
-            "CanSeek" to true,
-            "ItemId" to mediaId,
-            "EventName" to "timeupdate"
-        )
-    }
+    ): Map<String, Any?> = buildBasePlaybackBody(
+        mediaId = mediaId,
+        media = media,
+        position = position,
+        selectedSubtitleIndex = selectedSubtitleIndex,
+        selectedAudioIndex = selectedAudioIndex,
+        isPaused = isPaused,
+        playbackRate = playbackRate,
+        eventName = "timeupdate"
+    )
 
     private fun buildStoppedBody(
         mediaId: String,
@@ -347,37 +354,14 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         selectedSubtitleIndex: Int,
         selectedAudioIndex: Int,
         playbackRate: Float = 1.0f
-    ): Map<String, Any?> {
-        val ticks = position * 10000
-        val playMethod = Utils.determinePlayMethod(media)
-        val mediaSources = media.mediaSources
-        val firstSource = mediaSources?.firstOrNull()
-        val runTimeTicks = firstSource?.runTimeTicks ?: 0L
-        val mediaSourceId = firstSource?.id ?: ""
-
-        return mapOf(
-            "VolumeLevel" to 100,
-            "IsMuted" to false,
-            "IsPaused" to true,
-            "RepeatMode" to "RepeatNone",
-            "Shuffle" to false,
-            "SubtitleOffset" to 0,
-            "PlaybackRate" to playbackRate,
-            "MaxStreamingBitrate" to 200000000,
-            "PositionTicks" to ticks,
-            "PlaybackStartTimeTicks" to System.currentTimeMillis() * 10000,
-            "SubtitleStreamIndex" to selectedSubtitleIndex,
-            "AudioStreamIndex" to selectedAudioIndex,
-            "BufferedRanges" to emptyList<Any>(),
-            "SeekableRanges" to listOf(
-                mapOf("start" to 0, "end" to runTimeTicks)
-            ),
-            "PlayMethod" to playMethod,
-            "PlaySessionId" to (media.playSessionId ?: ""),
-            "MediaSourceId" to mediaSourceId,
-            "CanSeek" to true,
-            "ItemId" to mediaId,
-            "EventName" to "Stopped"
-        )
-    }
+    ): Map<String, Any?> = buildBasePlaybackBody(
+        mediaId = mediaId,
+        media = media,
+        position = position,
+        selectedSubtitleIndex = selectedSubtitleIndex,
+        selectedAudioIndex = selectedAudioIndex,
+        isPaused = true,
+        playbackRate = playbackRate,
+        eventName = "Stopped"
+    )
 }
