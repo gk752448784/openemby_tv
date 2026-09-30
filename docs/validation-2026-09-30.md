@@ -1,5 +1,21 @@
 # 2026-09-30 播放与代理体验修复验证
 
+## 后续修正：代理测试改为国内 / 国外连接延迟
+
+根据用户澄清，代理测试无需 Emby 登录、服务器地址或媒体库。当前版本替代下面历史记录中的 Emby 请求与海报下载测速。
+
+- 国内目标：`https://www.baidu.com/`；国外目标：`https://www.gstatic.com/generate_204`。
+- 两个目标并行通过当前填写的代理发起 HTTPS HEAD 请求，不携带 Emby token，不下载正文，不保存代理草稿。
+- 分别显示 HTTPS 响应耗时（包含 DNS、连接、TLS 和服务端响应），以及 HTTP 错误或连接失败。某个目标失败不会丢失另一个目标的结果。
+- 保留现有超时、修改配置/退出页面取消请求、释放独立测速 client 的行为；禁用缓存、跳转与连接级自动重试，以免混入下载或额外请求时间。
+- 旧登录提示及海报 Mbps 文案已删除。
+
+沿用下方独立 Kotlin 编译与运行命令，实际结果：`PASS: no-login domestic/overseas latency, HEAD/no-token/no-cache, independent HTTP/connection errors and direct route checks`；播放/重试 27 项检查继续通过。修复前空服务器、空账户执行测试失败：`Latency test must work without an Emby server/login: IllegalArgumentException`。
+
+另执行 XML 解析、代理界面引用资源检查、`git diff --check` 与 itms-risk-scan。完整 APK 编译、真实设备及用户代理链路尚未验证。本次修正保持未提交。
+
+以下为首次提交的历史验证记录。
+
 ## 已修改
 
 - 图片临时网络错误：最多 3 次重试，间隔 1 / 3 / 8 秒；404、认证和证书错误不循环重试，保留成功图片缓存。

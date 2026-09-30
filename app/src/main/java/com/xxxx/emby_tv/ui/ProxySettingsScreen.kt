@@ -66,7 +66,6 @@ import com.xxxx.emby_tv.R
 import com.xxxx.emby_tv.data.local.PreferencesManager
 import com.xxxx.emby_tv.data.remote.HttpClient
 import com.xxxx.emby_tv.data.remote.ProxySpeedTest
-import com.xxxx.emby_tv.data.repository.EmbyRepository
 import kotlinx.coroutines.CancellationException
 import okhttp3.OkHttpClient
 import com.xxxx.emby_tv.ui.components.TvInputDialog
@@ -317,12 +316,8 @@ fun ProxySettingsScreen(
                         enabled = !testing,
                         onClick = {
                             val port = proxyPort.toIntOrNull()
-                            val repository = EmbyRepository.getInstance(context)
-                            val server = repository.serverUrl
                             if (proxyHost.isBlank() || port == null || port !in 1..65535) {
                                 testResult = context.getString(R.string.proxy_test_invalid)
-                            } else if (server.isNullOrBlank() || repository.userId.isNullOrBlank() || repository.apiKey.isNullOrBlank()) {
-                                testResult = context.getString(R.string.proxy_test_no_server)
                             } else {
                                 testJob = scope.launch {
                                     testing = true
@@ -332,20 +327,24 @@ fun ProxySettingsScreen(
                                         val activeClient = HttpClient.createTestClient(context, proxyType, proxyHost, port, proxyUsername, proxyPassword)
                                         client = activeClient
                                         testClient = activeClient
-                                        val result = ProxySpeedTest.run(activeClient, server, repository.userId!!, repository.apiKey!!)
-                                        testResult = listOf(
-                                            context.getString(if (result.usesProxy) R.string.proxy_test_proxy else R.string.proxy_test_direct),
-                                            context.getString(R.string.proxy_test_latency, result.latencyMs),
-                                            result.mbps?.let { context.getString(R.string.proxy_test_speed, it, result.bytes / 1024) }
-                                                ?: context.getString(R.string.proxy_test_no_sample)
-                                        ).joinToString("\n")
+                                        val results = ProxySpeedTest.run(activeClient)
+                                        testResult = results.joinToString("\n") { result ->
+                                            val target = context.getString(if (result.target == ProxySpeedTest.Target.DOMESTIC)
+                                                R.string.proxy_test_domestic else R.string.proxy_test_overseas)
+                                            val route = context.getString(if (result.usesProxy)
+                                                R.string.proxy_test_proxy else R.string.proxy_test_direct)
+                                            val outcome = when (result.failure) {
+                                                ProxySpeedTest.Failure.HTTP -> context.getString(R.string.proxy_test_http_error, result.httpStatus)
+                                                ProxySpeedTest.Failure.CONNECTION -> context.getString(R.string.proxy_test_connection_error)
+                                                null -> context.getString(R.string.proxy_test_latency, result.latencyMs)
+                                            }
+                                            context.getString(R.string.proxy_test_result, target, outcome, route)
+                                        }
                                     } catch (e: CancellationException) {
                                         throw e
                                     } catch (e: Exception) {
-                                        val reason = if (e is ProxySpeedTest.HttpError) {
-                                            context.getString(R.string.proxy_test_http_error, e.status)
-                                        } else context.getString(R.string.proxy_test_connection_error)
-                                        testResult = context.getString(R.string.proxy_test_failed, reason)
+                                        testResult = context.getString(R.string.proxy_test_failed,
+                                            context.getString(R.string.proxy_test_connection_error))
                                     } finally {
                                         client?.dispatcher?.cancelAll()
                                         client?.connectionPool?.evictAll()

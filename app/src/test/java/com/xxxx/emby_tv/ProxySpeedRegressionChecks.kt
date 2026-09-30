@@ -11,48 +11,48 @@ import java.net.Proxy
 import java.net.ProxySelector
 import java.net.SocketAddress
 import java.net.URI
+import java.io.IOException
 
-// Application interceptor returns synthetic Emby responses; no socket or real server is used.
+// Synthetic responses: no socket, Emby server, account or credentials are needed.
 fun proxySpeedRegressionChecks() = runBlocking {
-    var status = 200
-    var emptyLibrary = false
-    val requests = mutableListOf<String>()
+    var domesticStatus = 200
+    var failOverseas = false
+    val requests = java.util.Collections.synchronizedList(mutableListOf<String>())
     val client = OkHttpClient.Builder()
         .proxySelector(object : ProxySelector() {
             override fun select(uri: URI) = listOf(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", 1080)))
-            override fun connectFailed(uri: URI?, sa: SocketAddress?, ioe: java.io.IOException?) = Unit
+            override fun connectFailed(uri: URI?, sa: SocketAddress?, ioe: IOException?) = Unit
         })
         .addInterceptor { chain ->
             val request = chain.request()
-            check(request.header("X-Emby-Token") == "test-token")
+            check(request.header("X-Emby-Token") == null)
+            check(request.header("Authorization") == null)
             check(request.header("Cache-Control") == "no-cache, no-store")
-            requests.add(request.url.encodedPath)
-            val body = when {
-                request.url.encodedPath.endsWith("/System/Info/Public") -> "{\"ServerName\":\"test\"}".toResponseBody()
-                request.url.encodedPath.endsWith("/Items") ->
-                    (if (emptyLibrary) "{\"Items\":[]}" else "{\"Items\":[{\"Id\":\"1\"}]}").toResponseBody()
-                else -> ByteArray(3 * 1024 * 1024).toResponseBody()
-            }
+            check(request.method == "HEAD")
+            requests.add(request.url.host)
+            val domestic = request.url.host == "www.baidu.com"
+            if (!domestic && failOverseas) throw IOException("synthetic timeout")
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1)
-                .code(status).message("test").body(body).build()
+                .code(if (domestic) domesticStatus else 204).message("test")
+                .body("".toResponseBody()).build()
         }.build()
     try {
-        val full = ProxySpeedTest.run(client, "https://emby.test", "user", "test-token")
-        check(full.usesProxy)
-        check(full.bytes == 2 * 1024 * 1024L) { "Sample must stop at 2 MiB" }
-        check(full.mbps != null && full.mbps > 0)
-        check(requests.size == 3)
-        emptyLibrary = true
-        val empty = ProxySpeedTest.run(client, "https://emby.test", "user", "test-token")
-        check(empty.mbps == null && empty.bytes == 0L)
-        status = 407
-        try {
-            ProxySpeedTest.run(client, "https://emby.test", "user", "test-token")
-            error("HTTP 407 must not count as success")
-        } catch (e: ProxySpeedTest.HttpError) {
-            check(e.status == 407)
-        }
-        println("PASS: proxy speed sample cap, token/cache headers, route, empty library and HTTP 407 checks")
+        val results = ProxySpeedTest.run(client)
+        check(results.map { it.target } == ProxySpeedTest.Target.entries.toList())
+        check(results.all { it.usesProxy && it.failure == null && it.latencyMs != null && it.latencyMs >= 0 })
+        check(requests.size == 2 && requests.toSet() == setOf("www.baidu.com", "www.gstatic.com"))
+        domesticStatus = 407
+        val partial = ProxySpeedTest.run(client)
+        check(partial[0].failure == ProxySpeedTest.Failure.HTTP && partial[0].httpStatus == 407 && partial[0].latencyMs == null)
+        check(partial[1].failure == null && partial[1].httpStatus == 204)
+        domesticStatus = 200
+        failOverseas = true
+        val disconnected = ProxySpeedTest.run(client)
+        check(disconnected[0].failure == null)
+        check(disconnected[1].failure == ProxySpeedTest.Failure.CONNECTION && disconnected[1].latencyMs == null)
+        val direct = ProxySpeedTest.run(client.newBuilder().proxy(Proxy.NO_PROXY).build())
+        check(direct.none { it.usesProxy })
+        println("PASS: no-login domestic/overseas latency, HEAD/no-token/no-cache, independent HTTP/connection errors and direct route checks")
     } finally {
         client.dispatcher.cancelAll()
         client.connectionPool.evictAll()
