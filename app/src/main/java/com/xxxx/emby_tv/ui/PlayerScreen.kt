@@ -59,6 +59,7 @@ import androidx.media3.common.Format
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.okhttp.OkHttpDataSource
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.DecoderReuseEvaluation
 import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
@@ -91,11 +92,15 @@ import com.xxxx.emby_tv.ui.player.SubtitleOffsetController
 import com.xxxx.emby_tv.ui.viewmodel.PlayerViewModel
 import com.xxxx.emby_tv.util.ErrorHandler
 import com.xxxx.emby_tv.util.IntroSkipHelper
+import com.xxxx.emby_tv.util.PlaybackRequest
+import com.xxxx.emby_tv.util.NetworkRetryPolicy
 import com.xxxx.emby_tv.data.local.PreferencesManager
 import com.xxxx.emby_tv.data.remote.EmbyApi
 import com.xxxx.emby_tv.data.remote.EmbyApi.CLIENT_VERSION
 import com.xxxx.emby_tv.data.remote.HttpClient
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -466,17 +471,20 @@ fun PlayerScreen(
     }
 
     val okHttpClient = HttpClient.getClient(context)
+    val playbackHeaders = remember {
+        mapOf(
+            "X-Emby-Client" to EmbyApi.CLIENT,
+            "X-Emby-Client-Version" to CLIENT_VERSION,
+            "X-Emby-Device-Name" to EmbyApi.DEVICE_NAME
+        )
+    }
 
 // 创建支持 OkHttp 的工厂
-    val dataSourceFactory = OkHttpDataSource.Factory(okHttpClient)
-        .setUserAgent(EmbyApi.CLIENT + "/" + CLIENT_VERSION)
-        .setDefaultRequestProperties(
-            mapOf(
-                "X-Emby-Client" to EmbyApi.CLIENT,
-                "X-Emby-Client-Version" to CLIENT_VERSION,
-                "X-Emby-Device-Name" to EmbyApi.DEVICE_NAME,
-            )
-        )
+    val dataSourceFactory = remember(okHttpClient) {
+        OkHttpDataSource.Factory(okHttpClient)
+            .setUserAgent(EmbyApi.CLIENT + "/" + CLIENT_VERSION)
+            .setDefaultRequestProperties(playbackHeaders)
+    }
 
     val mediaSourceFactory = DefaultMediaSourceFactory(context)
         .setDataSourceFactory(dataSourceFactory)
@@ -504,6 +512,8 @@ fun PlayerScreen(
     }
 
     var player by remember { mutableStateOf(buildPlayer()) }
+    var networkRetryAttempt by remember { mutableIntStateOf(0) }
+    var networkRetryJob by remember { mutableStateOf<Job?>(null) }
 
     // ===== 音频故障自动恢复（全程自动，无用户交互）=====
     // 0: 正常；1: 已用立体声安全模式重建过播放器；2: 已降级为无声播放
@@ -667,38 +677,26 @@ fun PlayerScreen(
                 // 直接访问mediaSources属性
                 val source = mediaResult.mediaSources.firstOrNull()
 
-                // 获取转码URL - 优先使用直链
-                val path = source?.directStreamUrl ?: source?.transcodingUrl
+                val path = PlaybackRequest.selectPath(source?.directStreamUrl, source?.transcodingUrl, true)
 
                 if (path != null) {
-                    val newVideoUrl = "${serverUrl}/emby$path"
+                    val newVideoUrl = PlaybackRequest.withApiKey(
+                        PlaybackRequest.resolveUrl(serverUrl, path), apiKey,
+                        path == source?.directStreamUrl && source?.addApiKeyToDirectStreamUrl == true
+                    )
 
                     // 切换到主线程更新UI
                     withContext(Dispatchers.Main) {
                         Log.d("PlayerScreen", "转码回退成功，更新视频URL")
-                        videoUrl = newVideoUrl
-
                         media = mediaResult
-
-                        //重要步骤
-                        player.stop()
-
-                        // 重新设置播放源
-                        val mediaItem = MediaItem.Builder()
-                            .setUri(newVideoUrl)
-                            .build()
-
-                        player.setMediaItem(mediaItem, position)
-                        Log.e(
-                            "FFmpegCheck",
-                            "FFmpeg Library Available: ${androidx.media3.decoder.ffmpeg.FfmpegLibrary.isAvailable()}"
-                        )
-                        player.prepare()
-                        player.playWhenReady = true
+                        videoUrl = newVideoUrl
+                        // The media effect applies headers and prepares the new source exactly once.
                     }
                 } else {
                     Log.e("PlayerScreen", "转码回退失败：没有找到转码URL")
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 Log.e("PlayerScreen", "转码回退过程中出现异常: ${e.message}", e)
             }
@@ -759,6 +757,7 @@ fun PlayerScreen(
             }
 
             if (mediaResult.mediaSources.isNullOrEmpty()) {
+                isBuffering = false
                 withContext(kotlinx.coroutines.Dispatchers.Main) {
                     android.widget.Toast.makeText(
                         context,
@@ -806,30 +805,34 @@ fun PlayerScreen(
                 selectedSubtitleIndex = source?.defaultSubtitleStreamIndex ?: -1
             }
 
-            // 构建 URL (参考 Flutter 逻辑)
-            var path = source?.directStreamUrl
-
-            // 如果强制转码(correction=1) 或者 没有直链(path=null)，则尝试使用转码链接
-            if (playbackCorrection == 1 || path == null) {
-                val transcodeUrl = source?.transcodingUrl
-                if (transcodeUrl != null) {
-                    path = transcodeUrl
-                }
+            val path = PlaybackRequest.selectPath(source?.directStreamUrl, source?.transcodingUrl,
+                hasTriedTranscodeFallback || playbackCorrection == 1)
+            videoUrl = path?.let {
+                PlaybackRequest.withApiKey(PlaybackRequest.resolveUrl(serverUrl, it), apiKey,
+                    it == source?.directStreamUrl && source?.addApiKeyToDirectStreamUrl == true)
             }
-
-
-            videoUrl = if (path != null) "${serverUrl}/emby$path" else null
+            if (videoUrl == null) {
+                isBuffering = false
+                android.widget.Toast.makeText(context, playbackInfoFailText, android.widget.Toast.LENGTH_LONG).show()
+            }
             hasReportedPlaying = false
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Throwable) {
+            isBuffering = false
+            android.widget.Toast.makeText(context, playbackInfoFailText, android.widget.Toast.LENGTH_LONG).show()
             Log.e("PlayerScreen", "加载播放信息失败", e)
         }
     }
 
     // 设置 MediaItem 和 字幕
-    LaunchedEffect(videoUrl, subtitleTracks) {
+    LaunchedEffect(videoUrl, subtitleTracks, media) {
         if (videoUrl != null) {
             val source = media.mediaSources?.firstOrNull()
             val mediaSourceId = source?.id ?: ""
+            networkRetryJob?.cancel()
+            networkRetryAttempt = 0
+            dataSourceFactory.setDefaultRequestProperties(playbackHeaders + source?.requiredHttpHeaders.orEmpty())
 
             // 使用 SubtitleConfigBuilder 构建字幕配置
             val subtitleConfigs = SubtitleConfigBuilder.buildSubtitleConfigs(
@@ -1227,6 +1230,35 @@ fun PlayerScreen(
 
             override fun onPlayerError(error: PlaybackException) {
                 Log.e("PlayerScreen", "播放器错误: ${error.message}", error)
+                // Transport failures retry the same source; transcoding cannot fix a broken connection.
+                val causes = generateSequence<Throwable>(error) { it.cause }.take(16).toList()
+                val httpStatus = causes.filterIsInstance<HttpDataSource.InvalidResponseCodeException>()
+                    .firstOrNull()?.responseCode
+                if (causes.any { it is HttpDataSource.HttpDataSourceException }) {
+                    // A missing/expired direct source can still be served through server transcoding.
+                    if (PlaybackRequest.shouldFallback(httpStatus, hasTriedTranscodeFallback)) {
+                        fallbackToServerTranscode()
+                        return
+                    }
+                    val waitMs = NetworkRetryPolicy.delayMs(networkRetryAttempt, error, httpStatus)
+                    if (waitMs != null) {
+                        networkRetryAttempt++
+                        networkRetryJob?.cancel()
+                        networkRetryJob = scope.launch {
+                            isBuffering = true
+                            delay(waitMs)
+                            if (player === p) {
+                                p.prepare()
+                                p.playWhenReady = true
+                            }
+                        }
+                    } else {
+                        isBuffering = false
+                        android.widget.Toast.makeText(context,
+                            context.getString(R.string.playback_network_failed), android.widget.Toast.LENGTH_LONG).show()
+                    }
+                    return
+                }
                 val causeMsg = error.cause?.message ?: ""
                 if (causeMsg.contains("SOCKS", ignoreCase = true) ||
                     causeMsg.contains("Proxy", ignoreCase = true) ||
@@ -1286,6 +1318,7 @@ fun PlayerScreen(
         p.addListener(listener)
 
         onDispose {
+            networkRetryJob?.cancel()
             bandwidthMeter.removeEventListener(bandwidthListener)
             p.stop()
             p.removeListener(listener)
@@ -1609,17 +1642,16 @@ fun PlayerScreen(
                         if (refreshedSubtitles.none { it.index == newIndex }) {
                             throw IllegalStateException(context.getString(R.string.online_subtitle_not_ready))
                         }
-                        val path = if (playbackCorrection == 1) {
-                            source.transcodingUrl ?: source.directStreamUrl
-                        } else {
-                            source.directStreamUrl ?: source.transcodingUrl
-                        } ?: throw IllegalStateException(context.getString(R.string.failed_get_playback_info))
+                        val path = PlaybackRequest.selectPath(source.directStreamUrl, source.transcodingUrl,
+                            hasTriedTranscodeFallback || playbackCorrection == 1)
+                            ?: throw IllegalStateException(context.getString(R.string.failed_get_playback_info))
                         position = resumePosition
                         media = refreshed
                         subtitleTracks = refreshedSubtitles
                         audioTracks = source.mediaStreams?.filter { it.type == "Audio" } ?: emptyList()
                         selectedSubtitleIndex = newIndex
-                        videoUrl = "${serverUrl}/emby$path"
+                        videoUrl = PlaybackRequest.withApiKey(PlaybackRequest.resolveUrl(serverUrl, path), apiKey,
+                            path == source.directStreamUrl && source.addApiKeyToDirectStreamUrl == true)
                     },
                     audioTracks = audioTracks,
                     selectedAudioIndex = selectedAudioIndex,

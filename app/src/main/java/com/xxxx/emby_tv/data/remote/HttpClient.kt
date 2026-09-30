@@ -82,9 +82,21 @@ object HttpClient {
         return false
     }
 
-    private fun createClient(context: Context, config: ProxyConfig): OkHttpClient {
+    /** Isolated client for draft settings; does not save settings or cancel active playback. */
+    fun createTestClient(context: Context, type: String, host: String, port: Int,
+                         username: String, password: String): OkHttpClient {
+        require(host.isNotBlank() && port in 1..65535)
+        return createClient(context, ProxyConfig(true, type, host.trim(), port, username, password), false)
+            .newBuilder()
+            .callTimeout(12, TimeUnit.SECONDS)
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private fun createClient(context: Context, config: ProxyConfig, useCache: Boolean = true): OkHttpClient {
         val builder = OkHttpClient.Builder()
-            .cache(getCache(context))
+            .cache(if (useCache) getCache(context) else null)
             .dispatcher(Dispatcher().apply {
                 maxRequests = 64
                 maxRequestsPerHost = 20

@@ -9,6 +9,7 @@ import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import com.xxxx.emby_tv.data.remote.HttpClient
+import com.xxxx.emby_tv.util.ImageRetryInterceptor
 
 class App : Application() {
     override fun onCreate() {
@@ -39,6 +40,7 @@ class App : Application() {
         SingletonImageLoader.setSafe { context ->
             ImageLoader.Builder(context)
                 .components {
+                    add(ImageRetryInterceptor())
                     add(OkHttpNetworkFetcherFactory(callFactory = { HttpClient.getClient(context) }))
                 }
                 .build()

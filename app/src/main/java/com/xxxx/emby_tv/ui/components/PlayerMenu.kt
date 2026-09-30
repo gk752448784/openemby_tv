@@ -131,7 +131,7 @@ fun PlayerMenu(
             Surface(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .fillMaxHeight(0.65f),
+                    .fillMaxHeight(0.38f),
                 shape = RoundedCornerShape(topStart = 16.dp, topEnd = 16.dp),
                 border = Border(BorderStroke(1.dp, Color.White.copy(alpha = 0.1f))),
                 colors = SurfaceDefaults.colors(
@@ -146,7 +146,7 @@ fun PlayerMenu(
                     LazyRow(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(20.dp),
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.Start
                     ) {
                         itemsIndexed(tabs) { index, title ->
@@ -185,16 +185,16 @@ fun PlayerMenu(
                                 Text(
                                     text = displayTitle,
                                     modifier = Modifier.padding(
-                                        horizontal = 16.dp,
-                                        vertical = 8.dp
+                                        horizontal = 12.dp,
+                                        vertical = 6.dp
                                     ),
-                                    style = TvMaterialTheme.typography.titleMedium
+                                    style = TvMaterialTheme.typography.bodyMedium
                                 )
                             }
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(4.dp))
 
                     // Content
                     Box(modifier = Modifier.weight(1f)) {
@@ -379,8 +379,6 @@ fun InfoTab(
                 text = mediaInfo.overview ?: "",
                 style = TvMaterialTheme.typography.bodyMedium,
                 lineHeight = 28.sp,
-                maxLines = 10,
-                overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(8.dp)
             )
         }
@@ -453,16 +451,10 @@ fun EpisodesTab(
     }
 
     // 1. 根据比例计算动态的宽高
-    val maxLength = 220.dp
     val maxAspectRatio = episodes.mapNotNull {
         val ratio = it.primaryImageAspectRatio?.toFloat()
         if (ratio == null || ratio == 1f) null else ratio
     }.maxOrNull() ?: 0.666f
-    val imgWidth = if (maxAspectRatio >= 1) {
-        maxLength
-    } else {
-        (maxLength.value * maxAspectRatio).dp
-    }
 
     // Auto scroll to current item
     val listState = rememberLazyListState()
@@ -475,11 +467,17 @@ fun EpisodesTab(
         }
     }
 
-    LazyRow(
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        // Reserve text, padding and focused-card scaling before sizing the poster.
+        val imageHeight = (maxHeight - 90.dp).coerceAtLeast(24.dp)
+        val imgWidth = minOf(220.dp, imageHeight * maxAspectRatio)
+        // Larger system fonts can still grow card captions: keep a vertical scroll fallback.
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        LazyRow(
         state = listState,
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(16.dp),
-        contentPadding = PaddingValues(16.dp)
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)
     ) {
         items(episodes) { episode ->
             val isCurrent = episode.id == currentItemId
@@ -501,6 +499,8 @@ fun EpisodesTab(
                 }
             )
         }
+    }
+    }
     }
 }
 

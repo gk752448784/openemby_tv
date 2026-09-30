@@ -65,6 +65,10 @@ import com.xxxx.emby_tv.QrCodeUtils
 import com.xxxx.emby_tv.R
 import com.xxxx.emby_tv.data.local.PreferencesManager
 import com.xxxx.emby_tv.data.remote.HttpClient
+import com.xxxx.emby_tv.data.remote.ProxySpeedTest
+import com.xxxx.emby_tv.data.repository.EmbyRepository
+import kotlinx.coroutines.CancellationException
+import okhttp3.OkHttpClient
 import com.xxxx.emby_tv.ui.components.TvInputDialog
 import com.xxxx.emby_tv.ui.theme.ThemeColorManager
 import com.xxxx.emby_tv.ui.viewmodel.MainViewModel
@@ -89,6 +93,17 @@ fun ProxySettingsScreen(
     var proxyPort by remember { mutableStateOf(prefs.proxyPort.toString()) }
     var proxyUsername by remember { mutableStateOf(prefs.proxyUsername) }
     var proxyPassword by remember { mutableStateOf(prefs.proxyPassword) }
+    var testing by remember { mutableStateOf(false) }
+    var testResult by remember { mutableStateOf<String?>(null) }
+    var testClient by remember { mutableStateOf<OkHttpClient?>(null) }
+    var testJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+
+    // Editing the draft invalidates the old result and cancels its network requests.
+    LaunchedEffect(proxyEnabled, proxyType, proxyHost, proxyPort, proxyUsername, proxyPassword) {
+        testClient?.dispatcher?.cancelAll()
+        testJob?.cancel()
+        testResult = null
+    }
 
     var qrCodeBitmap by remember { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
     var localServerAddress by remember { mutableStateOf("") }
@@ -141,6 +156,9 @@ fun ProxySettingsScreen(
     DisposableEffect(Unit) {
         onDispose {
             localServer?.stop()
+            testClient?.dispatcher?.cancelAll()
+            testClient?.connectionPool?.evictAll()
+            testClient?.dispatcher?.executorService?.shutdown()
         }
     }
 
@@ -289,7 +307,68 @@ fun ProxySettingsScreen(
                         onClick = { showPasswordDialog = true }
                     )
 
-                    Spacer(modifier = Modifier.height(30.dp))
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Text(stringResource(R.string.proxy_test_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.fillMaxWidth(0.8f))
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(
+                        enabled = !testing,
+                        onClick = {
+                            val port = proxyPort.toIntOrNull()
+                            val repository = EmbyRepository.getInstance(context)
+                            val server = repository.serverUrl
+                            if (proxyHost.isBlank() || port == null || port !in 1..65535) {
+                                testResult = context.getString(R.string.proxy_test_invalid)
+                            } else if (server.isNullOrBlank() || repository.userId.isNullOrBlank() || repository.apiKey.isNullOrBlank()) {
+                                testResult = context.getString(R.string.proxy_test_no_server)
+                            } else {
+                                testJob = scope.launch {
+                                    testing = true
+                                    testResult = null
+                                    var client: OkHttpClient? = null
+                                    try {
+                                        val activeClient = HttpClient.createTestClient(context, proxyType, proxyHost, port, proxyUsername, proxyPassword)
+                                        client = activeClient
+                                        testClient = activeClient
+                                        val result = ProxySpeedTest.run(activeClient, server, repository.userId!!, repository.apiKey!!)
+                                        testResult = listOf(
+                                            context.getString(if (result.usesProxy) R.string.proxy_test_proxy else R.string.proxy_test_direct),
+                                            context.getString(R.string.proxy_test_latency, result.latencyMs),
+                                            result.mbps?.let { context.getString(R.string.proxy_test_speed, it, result.bytes / 1024) }
+                                                ?: context.getString(R.string.proxy_test_no_sample)
+                                        ).joinToString("\n")
+                                    } catch (e: CancellationException) {
+                                        throw e
+                                    } catch (e: Exception) {
+                                        val reason = if (e is ProxySpeedTest.HttpError) {
+                                            context.getString(R.string.proxy_test_http_error, e.status)
+                                        } else context.getString(R.string.proxy_test_connection_error)
+                                        testResult = context.getString(R.string.proxy_test_failed, reason)
+                                    } finally {
+                                        client?.dispatcher?.cancelAll()
+                                        client?.connectionPool?.evictAll()
+                                        client?.dispatcher?.executorService?.shutdown()
+                                        testClient = null
+                                        testing = false
+                                    }
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(0.8f).height(48.dp)
+                    ) {
+                        if (testing) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        Text(stringResource(if (testing) R.string.proxy_testing else R.string.proxy_test))
+                    }
+                    testResult?.let {
+                        Text(it, modifier = Modifier.fillMaxWidth(0.8f).padding(vertical = 8.dp),
+                            style = MaterialTheme.typography.bodyMedium)
+                    }
+                    Spacer(modifier = Modifier.height(16.dp))
 
                     Button(
                         onClick = {
