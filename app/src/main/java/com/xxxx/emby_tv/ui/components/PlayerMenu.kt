@@ -55,7 +55,7 @@ fun PlayerMenu(
     subtitleTracks: List<MediaStreamDto>,
     selectedSubtitleIndex: Int,
     onSubtitleSelect: (Int) -> Unit,
-    onOnlineSubtitleDownloaded: suspend (Int) -> Unit,
+    onOnlineSubtitleDownloaded: suspend (com.xxxx.emby_tv.data.remote.LocalSubtitle) -> Unit,
     audioTracks: List<MediaStreamDto>,
     selectedAudioIndex: Int,
     onAudioSelect: (Int) -> Unit,
@@ -220,9 +220,7 @@ fun PlayerMenu(
                             )
 
                             "OnlineSubtitles" -> OnlineSubtitlesTab(
-                                mediaId = mediaId,
-                                mediaSourceId = media.mediaSources?.firstOrNull()?.id,
-                                repository = repository,
+                                mediaInfo = mediaInfo,
                                 onDownloaded = { index ->
                                     onOnlineSubtitleDownloaded(index)
                                     onDismiss()
@@ -759,7 +757,7 @@ fun SubtitlesTab(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(title)
+                    Text(title, modifier = Modifier.weight(1f))
                     if (isSelected) Icon(
                         Icons.Default.Check,
                         null,

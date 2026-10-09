@@ -1,5 +1,33 @@
 # 2026-09-30 播放与代理体验修复验证
 
+## 后续修正：测速结束闪退（本地 Android TV 模拟器）
+
+模拟器 `emulator-5554` 原应用的 crash buffer 记录两次主线程崩溃：
+
+```text
+android.os.NetworkOnMainThreadException
+ConscryptEngineSocket.close
+RealConnectionPool.evictAll
+ProxySettingsScreen.kt:350
+```
+
+原因是测速 `finally` 在 Compose 主线程清空连接池；HTTPS 关闭连接时可能发送 TLS 数据。页面 `onDispose` 原先也直接清空连接池。
+
+最小修复：编辑草稿或离页只取消测速 job；由同一个 `finally` 在 `withContext(NonCancellable + Dispatchers.IO)` 中取消请求、清空连接池并关闭 executor，确保取消后仍能释放资源。
+
+实际验证：
+
+- `JAVA_HOME=/home/cloud/Documents/jdk-21.0.9 ANDROID_HOME=/home/cloud/Android/Sdk ./gradlew :app:assembleDebug --no-daemon`：完整 APK 构建成功。
+- 原应用与本地 debug 签名不同，`adb install -r` 被拒绝：`INSTALL_FAILED_UPDATE_INCOMPATIBLE`。使用 `/tmp/emby-latency-test.init.gradle` 临时增加 `.latencytest` 包名后构建、安装成功，原应用及数据保留；项目构建配置未改动。
+- 未登录 Emby，HTTP 代理 `10.0.2.2:10808`，连续三次测速：国内 / 国外分别为 222 / 481 ms、186 / 334 ms、191 / 790 ms。每次结果出现后可再次测速。
+- 错误代理 `127.0.0.1:10808`：国内、国外均显示连接失败，无闪退。
+- 不可达代理 `10.255.255.1:10808`：启动测速立即按返回，正常回到登录页。
+- 全程测试版进程 PID 保持 5453；`adb -s emulator-5554 logcat -b crash -d --pid=5453` 输出为空。
+- 最终版还将 `testing = false` 放入外层 `finally`，避免取消协程返回 UI 线程时跳过状态复位。重新安装后，测速中将不可达代理改为有效代理，按钮恢复可用；再次测速国内 / 国外 360 / 774 ms，PID 5874 的 crash buffer 为空。
+- `git diff --check` 通过。itms-risk-scan 指定实际根仓库扫描完成，但本次 Kotlin 不属于扫描器支持类型，覆盖文件 0，不能把零风险作为 Kotlin 验证结论。
+
+这次覆盖测速与取消路径，未复验真实电视、媒体播放或图片加载。修复保持未提交。
+
 ## 后续修正：代理测试改为国内 / 国外连接延迟
 
 根据用户澄清，代理测试无需 Emby 登录、服务器地址或媒体库。当前版本替代下面历史记录中的 Emby 请求与海报下载测速。

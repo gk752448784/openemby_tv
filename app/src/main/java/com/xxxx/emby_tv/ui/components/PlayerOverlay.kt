@@ -93,7 +93,7 @@ fun PlayerOverlay(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.5f))
+            .background(Color.Black.copy(alpha = if (isPlaying) 0f else 0.5f))
             .padding(16.dp)
     ) {
         // 倍速角标（仅 != 1.0x 时显示）
@@ -111,7 +111,7 @@ fun PlayerOverlay(
         }
 
         // Top Info
-        Column(modifier = Modifier.align(Alignment.TopStart)) {
+        if (!isPlaying) Column(modifier = Modifier.align(Alignment.TopStart)) {
             val parentIndex = mediaInfo.parentIndexNumber
             val index = mediaInfo.indexNumber
             val productionYear = mediaInfo.productionYear?.toString()
@@ -254,8 +254,29 @@ fun PlayerOverlay(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .padding(bottom = 32.dp)
+                .padding(bottom = 8.dp)
+                .background(Color.Black.copy(alpha = 0.55f), RoundedCornerShape(8.dp))
+                .padding(12.dp)
         ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(
+                    Icons.Default.KeyboardArrowDown,
+                    contentDescription = null,
+                    tint = Color.LightGray,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = stringResource(R.string.press_menu_down_to_show_menu),
+                    color = Color.LightGray,
+                    fontSize = 14.sp
+                )
+            }
+            Spacer(modifier = Modifier.height(6.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
@@ -299,26 +320,6 @@ fun PlayerOverlay(
                 }
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.Center,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-
-                Icon(
-                    Icons.Default.KeyboardArrowDown,
-                    contentDescription = null,
-                    tint = Color.LightGray,
-                    modifier = Modifier.size(16.dp)
-                )
-                Spacer(modifier = Modifier.width(4.dp))
-                Text(
-                    text = stringResource(R.string.press_menu_down_to_show_menu),
-                    color = Color.LightGray,
-                    fontSize = 14.sp
-                )
-            }
         }
     }
 }

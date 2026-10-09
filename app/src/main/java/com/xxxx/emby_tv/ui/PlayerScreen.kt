@@ -1,5 +1,10 @@
 package com.xxxx.emby_tv.ui
 
+import android.net.Uri
+import java.io.File
+import androidx.media3.datasource.DefaultDataSource
+import com.xxxx.emby_tv.data.remote.LocalSubtitle
+import com.xxxx.emby_tv.data.remote.AssrtSubtitles
 import android.app.ActivityManager
 import android.content.Context
 import android.content.pm.ApplicationInfo
@@ -202,6 +207,11 @@ fun PlayerScreen(
     // 状态变量
     var isPlaying by remember { mutableStateOf(false) }
     var isShowInfo by remember { mutableStateOf(false) }
+    var infoInteraction by remember { mutableIntStateOf(0) }
+    fun showPlaybackInfo() {
+        isShowInfo = true
+        infoInteraction++
+    }
     var media by remember { mutableStateOf<MediaDto>(MediaDto()) }
     var mediaInfo by remember { mutableStateOf<BaseItemDto>(BaseItemDto()) }
     var session by remember { mutableStateOf<SessionDto?>(null) }
@@ -211,6 +221,12 @@ fun PlayerScreen(
     var isFavorite by remember { mutableStateOf(false) }
 
     var subtitleTracks by remember { mutableStateOf<List<MediaStreamDto>>(emptyList()) }
+    var localSubtitle by remember(mediaId) { mutableStateOf<LocalSubtitle?>(null) }
+    var subtitleResumePlayWhenReady by remember { mutableStateOf<Boolean?>(null) }
+    val displayedSubtitleTracks = subtitleTracks + listOfNotNull(localSubtitle?.let {
+        MediaStreamDto(index = AssrtSubtitles.LOCAL_INDEX, type = "Subtitle", codec = it.codec,
+            displayTitle = "ASSRT: ${it.name}", isExternal = true, supportsExternalStream = true)
+    })
     var selectedSubtitleIndex by remember { mutableStateOf(-99) }
     var audioTracks by remember { mutableStateOf<List<MediaStreamDto>>(emptyList()) }
     var selectedAudioIndex by remember { mutableStateOf(-1) }
@@ -487,7 +503,7 @@ fun PlayerScreen(
     }
 
     val mediaSourceFactory = DefaultMediaSourceFactory(context)
-        .setDataSourceFactory(dataSourceFactory)
+        .setDataSourceFactory(DefaultDataSource.Factory(context, dataSourceFactory))
 
     // ExoPlayer 构建函数（音频自动恢复时需要整体重建播放器）
     fun buildPlayer(): ExoPlayer {
@@ -567,6 +583,13 @@ fun PlayerScreen(
     var leftKeyDownTime by remember { mutableStateOf(0L) }
     var rightKeyDownTime by remember { mutableStateOf(0L) }
 
+    LaunchedEffect(isShowInfo, infoInteraction, isPlaying, showMenu, leftKeyDownTime, rightKeyDownTime) {
+        if (isShowInfo && isPlaying && !showMenu && leftKeyDownTime == 0L && rightKeyDownTime == 0L) {
+            delay(4000)
+            isShowInfo = false
+        }
+    }
+
     // 即使暂停播放也不会熄屏
     DisposableEffect(view) {
         val previous = view.keepScreenOn
@@ -603,7 +626,8 @@ fun PlayerScreen(
     LaunchedEffect(player) {
         while (isActive) {
             overlaySubtitleView.value?.setCues(
-                subtitleOffsetController.cuesFor(player.currentPosition, subtitleTimeOffsetMs)
+                if (selectedSubtitleIndex == -1) emptyList()
+                else subtitleOffsetController.cuesFor(player.currentPosition, subtitleTimeOffsetMs)
             )
             delay(50)
         }
@@ -677,7 +701,8 @@ fun PlayerScreen(
                 // 直接访问mediaSources属性
                 val source = mediaResult.mediaSources.firstOrNull()
 
-                val path = PlaybackRequest.selectPath(source?.directStreamUrl, source?.transcodingUrl, true)
+                // A failed decoder cannot recover by replaying the same unsupported direct source.
+                val path = source?.transcodingUrl?.takeIf { it.isNotBlank() }
 
                 if (path != null) {
                     val newVideoUrl = PlaybackRequest.withApiKey(
@@ -694,6 +719,11 @@ fun PlayerScreen(
                     }
                 } else {
                     Log.e("PlayerScreen", "转码回退失败：没有找到转码URL")
+                    withContext(Dispatchers.Main) {
+                        android.widget.Toast.makeText(context,
+                            context.getString(R.string.playback_transcode_unavailable),
+                            android.widget.Toast.LENGTH_LONG).show()
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -826,7 +856,7 @@ fun PlayerScreen(
     }
 
     // 设置 MediaItem 和 字幕
-    LaunchedEffect(videoUrl, subtitleTracks, media) {
+    LaunchedEffect(videoUrl, subtitleTracks, media, localSubtitle) {
         if (videoUrl != null) {
             val source = media.mediaSources?.firstOrNull()
             val mediaSourceId = source?.id ?: ""
@@ -844,9 +874,17 @@ fun PlayerScreen(
                 selectedSubtitleIndex = selectedSubtitleIndex
             )
 
+            val localConfig = localSubtitle?.let {
+                MediaItem.SubtitleConfiguration.Builder(Uri.fromFile(File(it.path)))
+                    .setId(AssrtSubtitles.LOCAL_INDEX.toString())
+                    .setLabel("ASSRT: ${it.name} [${AssrtSubtitles.LOCAL_INDEX}]")
+                    .setMimeType(SubtitleConfigBuilder.getMimeType(it.codec))
+                    .setSelectionFlags(if (selectedSubtitleIndex == AssrtSubtitles.LOCAL_INDEX) C.SELECTION_FLAG_DEFAULT else 0)
+                    .build()
+            }
             val mediaItemBuilder = MediaItem.Builder()
                 .setUri(videoUrl)
-                .setSubtitleConfigurations(subtitleConfigs)
+                .setSubtitleConfigurations(subtitleConfigs + listOfNotNull(localConfig))
 
            // 计算起始位置：优先级为播放进度 > 参数传入位置 > 0
             val startPositionMs = if (position > 0) {
@@ -867,15 +905,16 @@ fun PlayerScreen(
             }
 
             player.prepare()
-            player.playWhenReady = true
+            player.playWhenReady = subtitleResumePlayWhenReady ?: true
+            subtitleResumePlayWhenReady = null
         }
     }
 
     // 更新选中字幕 - 使用 PlayerTrackManager
-    LaunchedEffect(selectedSubtitleIndex, subtitleTracks, currentTracks) {
+    LaunchedEffect(selectedSubtitleIndex, displayedSubtitleTracks, currentTracks) {
         PlayerTrackManager.selectSubtitle(
             player,
-            subtitleTracks,
+            displayedSubtitleTracks,
             selectedSubtitleIndex,
             currentTracks
         )
@@ -930,7 +969,7 @@ fun PlayerScreen(
                             mediaId = mediaId,
                             media = media,
                             position = position,
-                            selectedSubtitleIndex = selectedSubtitleIndex,
+                            selectedSubtitleIndex = selectedSubtitleIndex.takeUnless { it == AssrtSubtitles.LOCAL_INDEX } ?: -1,
                             selectedAudioIndex = selectedAudioIndex,
                             playbackRate = currentPlaybackSpeed
                         )
@@ -952,7 +991,7 @@ fun PlayerScreen(
                     mediaId = mediaId,
                     media = media,
                     position = position,
-                    selectedSubtitleIndex = selectedSubtitleIndex,
+                    selectedSubtitleIndex = selectedSubtitleIndex.takeUnless { it == AssrtSubtitles.LOCAL_INDEX } ?: -1,
                     selectedAudioIndex = selectedAudioIndex,
                     playbackRate = playbackSpeed
                 )
@@ -1207,7 +1246,7 @@ fun PlayerScreen(
                                 mediaId = mediaId,
                                 media = media,
                                 position = position,
-                                selectedSubtitleIndex = selectedSubtitleIndex,
+                                selectedSubtitleIndex = selectedSubtitleIndex.takeUnless { it == AssrtSubtitles.LOCAL_INDEX } ?: -1,
                                 selectedAudioIndex = selectedAudioIndex,
                                 playbackRate = playbackSpeed
                             )
@@ -1219,7 +1258,7 @@ fun PlayerScreen(
                             mediaId = mediaId,
                             media = media,
                             position = position,
-                            selectedSubtitleIndex = selectedSubtitleIndex,
+                            selectedSubtitleIndex = selectedSubtitleIndex.takeUnless { it == AssrtSubtitles.LOCAL_INDEX } ?: -1,
                             selectedAudioIndex = selectedAudioIndex,
                             playbackRate = playbackSpeed
                         )
@@ -1334,7 +1373,7 @@ fun PlayerScreen(
                 mediaId = mediaId,
                 media = media,
                 position = position,
-                selectedSubtitleIndex = selectedSubtitleIndex,
+                selectedSubtitleIndex = selectedSubtitleIndex.takeUnless { it == AssrtSubtitles.LOCAL_INDEX } ?: -1,
                 selectedAudioIndex = selectedAudioIndex,
                 playbackRate = playbackSpeed
             )
@@ -1355,7 +1394,7 @@ fun PlayerScreen(
                 .fillMaxSize()
                 .background(Color.Black)
                 .clickable(enabled = true, onClick = {
-                    if (isPlaying) {
+                    if (player.playWhenReady) {
                         player.pause()
                         isShowInfo = true
                     } else {
@@ -1373,7 +1412,7 @@ fun PlayerScreen(
                         if (event.type == KeyEventType.KeyDown) {
                             if (leftKeyDownTime == 0L) {
                                 leftKeyDownTime = System.currentTimeMillis()
-                                isShowInfo = true
+                                showPlaybackInfo()
                             }
                         } else if (event.type == KeyEventType.KeyUp) {
                             if (leftKeyDownTime > 0) {
@@ -1381,6 +1420,8 @@ fun PlayerScreen(
                                     player.seekBack()
                                 }
                                 leftKeyDownTime = 0L
+                                position = player.currentPosition.coerceAtLeast(0L)
+                                showPlaybackInfo()
                             }
                         }
                         return@onKeyEvent true
@@ -1389,7 +1430,7 @@ fun PlayerScreen(
                         if (event.type == KeyEventType.KeyDown) {
                             if (rightKeyDownTime == 0L) {
                                 rightKeyDownTime = System.currentTimeMillis()
-                                isShowInfo = true
+                                showPlaybackInfo()
                             }
                         } else if (event.type == KeyEventType.KeyUp) {
                             if (rightKeyDownTime > 0) {
@@ -1397,19 +1438,27 @@ fun PlayerScreen(
                                     player.seekForward()
                                 }
                                 rightKeyDownTime = 0L
+                                position = player.currentPosition.coerceAtLeast(0L)
+                                showPlaybackInfo()
                             }
                         }
                         return@onKeyEvent true
                     }
 
                     if (event.type == KeyEventType.KeyDown) {
-                        if (event.key == Key.DirectionDown || event.key == Key.Menu) {
+                        if (event.key == Key.DirectionDown) {
+                            if (event.nativeKeyEvent.repeatCount == 0) {
+                                if (isShowInfo) showMenu = true else showPlaybackInfo()
+                            }
+                            return@onKeyEvent true
+                        }
+                        if (event.key == Key.Menu) {
                             showMenu = true
                             return@onKeyEvent true
                         }
                         if (event.key == Key.DirectionCenter || event.key == Key.Enter || event.key == Key.NumPadEnter) {
                             if (showMenu) return@onKeyEvent false
-                            if (isPlaying) {
+                            if (player.playWhenReady) {
                                 player.pause()
                                 isShowInfo = true
                             } else {
@@ -1419,7 +1468,7 @@ fun PlayerScreen(
                             return@onKeyEvent true
                         }
                         // Show info on any key
-                        isShowInfo = true
+                        showPlaybackInfo()
                         // Hide info after delay?
                     }
                     false
@@ -1491,8 +1540,8 @@ fun PlayerScreen(
             )
 
 
-            // 2. Full Info Overlay Layer (only when isShowInfo)
-            if (isShowInfo && !isPlaying) {
+            // Keep progress visible during playback and seeking, not only during buffering.
+            if (isShowInfo && !showMenu) {
                 PlayerOverlay(
                     isTunnelingSafe = isTunnelingSafe,
                     mediaInfo = mediaInfo,
@@ -1618,40 +1667,17 @@ fun PlayerScreen(
                     media = media,
                     mediaId = mediaId,
                     mediaInfo = mediaInfo,
-                    subtitleTracks = subtitleTracks,
+                    subtitleTracks = displayedSubtitleTracks,
                     selectedSubtitleIndex = selectedSubtitleIndex,
                     onSubtitleSelect = { index ->
                         changeTrack(selectedAudioIndex, index)
                     },
-                    onOnlineSubtitleDownloaded = { newIndex ->
-                        val resumePosition = player.currentPosition.coerceAtLeast(0L)
-                        val currentSourceId = media.mediaSources?.firstOrNull()?.id
-                        val refreshed = repository.getPlaybackInfo(
-                            mediaId,
-                            resumePosition * 10000,
-                            selectedAudioIndex.takeIf { it >= 0 },
-                            newIndex,
-                            hasTriedTranscodeFallback || playbackCorrection == 1
-                        )
-                        val source = refreshed.mediaSources?.firstOrNull()
-                            ?: throw IllegalStateException(context.getString(R.string.failed_get_playback_info))
-                        if (source.id != currentSourceId) {
-                            throw IllegalStateException(context.getString(R.string.online_subtitle_not_ready))
-                        }
-                        val refreshedSubtitles = source.mediaStreams?.filter { it.type == "Subtitle" } ?: emptyList()
-                        if (refreshedSubtitles.none { it.index == newIndex }) {
-                            throw IllegalStateException(context.getString(R.string.online_subtitle_not_ready))
-                        }
-                        val path = PlaybackRequest.selectPath(source.directStreamUrl, source.transcodingUrl,
-                            hasTriedTranscodeFallback || playbackCorrection == 1)
-                            ?: throw IllegalStateException(context.getString(R.string.failed_get_playback_info))
-                        position = resumePosition
-                        media = refreshed
-                        subtitleTracks = refreshedSubtitles
-                        audioTracks = source.mediaStreams?.filter { it.type == "Audio" } ?: emptyList()
-                        selectedSubtitleIndex = newIndex
-                        videoUrl = PlaybackRequest.withApiKey(PlaybackRequest.resolveUrl(serverUrl, path), apiKey,
-                            path == source.directStreamUrl && source.addApiKeyToDirectStreamUrl == true)
+                    onOnlineSubtitleDownloaded = { downloaded ->
+                        position = player.currentPosition.coerceAtLeast(0L)
+                        subtitleResumePlayWhenReady = player.playWhenReady
+                        subtitleOffsetController.reset()
+                        localSubtitle = downloaded
+                        selectedSubtitleIndex = AssrtSubtitles.LOCAL_INDEX
                     },
                     audioTracks = audioTracks,
                     selectedAudioIndex = selectedAudioIndex,

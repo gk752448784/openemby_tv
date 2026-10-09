@@ -12,6 +12,11 @@ val keystorePropertiesFile = rootProject.file("key.properties")
 if (keystorePropertiesFile.exists()) {
     keystoreProperties.load(FileInputStream(keystorePropertiesFile))
 }
+val localBuildProperties = Properties().apply {
+    rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
+}
+val assrtToken = (System.getenv("ASSRT_TOKEN")?.takeIf { it.isNotBlank() } ?: localBuildProperties.getProperty("assrt.token", ""))
+    .also { require(it.isEmpty() || it.matches(Regex("[A-Za-z0-9]{32}"))) { "Invalid ASSRT token format" } }
 android {
     namespace = "com.xxxx.emby_tv"
     compileSdk {
@@ -27,7 +32,8 @@ android {
         minSdk = 23
         targetSdk = 36
         versionName = "2.0.20"
-         versionCode = 220
+        versionCode = 220
+        buildConfigField("String", "ASSRT_TOKEN", "\"$assrtToken\"")
 //        versionCode = 92
 
     }

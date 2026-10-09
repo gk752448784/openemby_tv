@@ -251,6 +251,7 @@
     <string name="proxy_indicator">代理</string>
     <string name="proxy_save">保存</string>
     <string name="playback_network_failed">播放连接失败，重试已结束。请检查网络或代理后重新播放。</string>
+    <string name="playback_transcode_unavailable">原片播放失败，服务器未提供转码流。请检查账号转码权限，或选择设备支持的片源。</string>
     <string name="proxy_test">测试延迟</string>
     <string name="proxy_testing">测速中…</string>
     <string name="proxy_test_hint">无需登录或保存。通过当前填写的代理分别测试国内、国外 HTTPS 响应延迟，包含 DNS、连接与 TLS 握手耗时。</string>
@@ -291,4 +292,10 @@
     <string name="proxy_test_domestic">国内（百度）</string>
     <string name="proxy_test_overseas">国外（Google）</string>
     <string name="proxy_test_result">%1$s：%2$s · %3$s</string>
+    <string name="assrt_keyword">搜索关键词（至少 3 个字）</string>
+    <string name="assrt_attribution">字幕服务由 assrt.net 提供</string>
+    <string name="assrt_back_results">返回搜索结果</string>
+    <string name="assrt_no_files">此条目没有可加载的 SRT / ASS / SSA / VTT 文件。</string>
+    <string name="assrt_empty">ASSRT 未找到字幕，请尝试缩短片名或使用别名。</string>
+    <string name="assrt_loading">正在加载字幕…</string>
 </resources>

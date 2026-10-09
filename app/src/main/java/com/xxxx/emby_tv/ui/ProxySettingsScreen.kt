@@ -67,6 +67,7 @@ import com.xxxx.emby_tv.data.local.PreferencesManager
 import com.xxxx.emby_tv.data.remote.HttpClient
 import com.xxxx.emby_tv.data.remote.ProxySpeedTest
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import okhttp3.OkHttpClient
 import com.xxxx.emby_tv.ui.components.TvInputDialog
 import com.xxxx.emby_tv.ui.theme.ThemeColorManager
@@ -94,12 +95,10 @@ fun ProxySettingsScreen(
     var proxyPassword by remember { mutableStateOf(prefs.proxyPassword) }
     var testing by remember { mutableStateOf(false) }
     var testResult by remember { mutableStateOf<String?>(null) }
-    var testClient by remember { mutableStateOf<OkHttpClient?>(null) }
     var testJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
 
     // Editing the draft invalidates the old result and cancels its network requests.
     LaunchedEffect(proxyEnabled, proxyType, proxyHost, proxyPort, proxyUsername, proxyPassword) {
-        testClient?.dispatcher?.cancelAll()
         testJob?.cancel()
         testResult = null
     }
@@ -155,9 +154,7 @@ fun ProxySettingsScreen(
     DisposableEffect(Unit) {
         onDispose {
             localServer?.stop()
-            testClient?.dispatcher?.cancelAll()
-            testClient?.connectionPool?.evictAll()
-            testClient?.dispatcher?.executorService?.shutdown()
+            testJob?.cancel()
         }
     }
 
@@ -326,7 +323,6 @@ fun ProxySettingsScreen(
                                     try {
                                         val activeClient = HttpClient.createTestClient(context, proxyType, proxyHost, port, proxyUsername, proxyPassword)
                                         client = activeClient
-                                        testClient = activeClient
                                         val results = ProxySpeedTest.run(activeClient)
                                         testResult = results.joinToString("\n") { result ->
                                             val target = context.getString(if (result.target == ProxySpeedTest.Target.DOMESTIC)
@@ -346,11 +342,17 @@ fun ProxySettingsScreen(
                                         testResult = context.getString(R.string.proxy_test_failed,
                                             context.getString(R.string.proxy_test_connection_error))
                                     } finally {
-                                        client?.dispatcher?.cancelAll()
-                                        client?.connectionPool?.evictAll()
-                                        client?.dispatcher?.executorService?.shutdown()
-                                        testClient = null
-                                        testing = false
+                                        // Closing TLS sockets can perform network I/O. Finish cleanup
+                                        // off the UI thread even when leaving the page cancels the job.
+                                        try {
+                                            withContext(NonCancellable + Dispatchers.IO) {
+                                                client?.dispatcher?.cancelAll()
+                                                client?.connectionPool?.evictAll()
+                                                client?.dispatcher?.executorService?.shutdown()
+                                            }
+                                        } finally {
+                                            testing = false
+                                        }
                                     }
                                 }
                             }
